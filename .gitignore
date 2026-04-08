@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Streamlit
+.streamlit/
+*.streamlit
+
+# YOLO / 模型
+runs/
+*.pt
+!assets/models/*.pt  # 保留模型
+*.weights
+*.onnx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 数据
+*.jpg
+*.jpeg
+*.png
+!assets/**/*.png  # 保留assets中的图片
+!assets/**/*.jpg
+
+# 临时文件
+*.tmp
+*.log
