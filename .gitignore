@@ -26,6 +26,7 @@ assets/standards/
 text1/
 text2/
 results/
+data/*.db
 
 # Streamlit
 .streamlit/

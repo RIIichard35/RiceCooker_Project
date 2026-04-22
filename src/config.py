@@ -11,6 +11,8 @@ CALIB_DIR      = os.path.join(ASSETS_DIR, "calibration") # ROI 标定文件（�
 MODELS_DIR     = os.path.join(ASSETS_DIR, "models")
 OUTPUT_DIR     = os.path.join(PROJECT_ROOT, "output")
 LOG_DIR        = os.path.join(PROJECT_ROOT, "logs")
+DB_DIR         = os.path.join(PROJECT_ROOT, "data")
+INSPECTION_DB_PATH = os.path.join(DB_DIR, "inspection_records.db")
 
 # ==========================================
 # 2. Stage1 — ORB 特征匹配

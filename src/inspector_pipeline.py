@@ -39,6 +39,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from src.config import (
     CALIB_DIR,
     HEF_PATH,
+    INSPECTION_DB_PATH,
     MAX_MISSING_COUNT,
     MIN_MATCH_COUNT,
     MODELS_DIR,
@@ -46,6 +47,7 @@ from src.config import (
 )
 from src.stage1_vision import Stage1Detector
 from src.stage2_scratch import Stage2Detector
+from src.stage3_sql import Stage3SQLRecorder
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -90,12 +92,20 @@ class InspectorPipeline:
         enable_stage2:   bool  = True,
         conf_threshold:  float = 0.25,
         missing_thresh:  int   = MAX_MISSING_COUNT,
+        enable_sql_record: bool = True,
+        db_path: str = INSPECTION_DB_PATH,
     ) -> None:
         self.view            = view
         self.calibrated_bbox = calibrated_bbox
         self.enable_stage2   = enable_stage2
         self.conf_threshold  = conf_threshold
         self.missing_thresh  = missing_thresh
+        self.enable_sql_record = enable_sql_record
+        self._recorder: Stage3SQLRecorder | None = None
+
+        if self.enable_sql_record:
+            self._recorder = Stage3SQLRecorder(db_path)
+            _log(f"Stage3 SQL 记录已启用: {db_path}")
 
         # ── 加载 Stage 1 ─────────────────────────────────────────────────
         std_dir = Path(STANDARDS_DIR) / view
@@ -124,7 +134,12 @@ class InspectorPipeline:
 
     # ── 公开接口 ──────────────────────────────────────────────────────────
 
-    def run(self, frames: list[np.ndarray]) -> dict:
+    def run(
+        self,
+        frames: list[np.ndarray],
+        product_id: str | None = None,
+        shift: str = "A",
+    ) -> dict:
         """
         对三连拍帧执行方案 D 检测。
 
@@ -150,6 +165,7 @@ class InspectorPipeline:
 
         n = len(frames)
         result: dict = {
+            "product_id":     product_id,
             "final_status":   "FAIL",
             "fail_reason":    None,
             "fail_frame_idx": None,
@@ -158,6 +174,9 @@ class InspectorPipeline:
             "stage2_result":  None,
             "timing":         {},
         }
+
+        if result["product_id"] is None and self._recorder is not None:
+            result["product_id"] = self._recorder.generate_product_id(shift=shift)
 
         # ── Step 1: 逐张跑 Stage 1 ───────────────────────────────────────
         _log(f"开始 Stage1 × {n} 张")
@@ -183,6 +202,8 @@ class InspectorPipeline:
                 result["fail_frame_idx"] = i
                 result["timing"]["stage1_total"] = time.time() - t_s1_start
                 _log(f"Stage1 FAIL at 帧[{i}]: {reason}")
+                result["timing"]["total"] = time.time() - t_s1_start
+                self._persist_if_needed(frames, result)
                 return result
 
         result["timing"]["stage1_total"] = time.time() - t_s1_start
@@ -199,6 +220,8 @@ class InspectorPipeline:
             result["final_status"] = "PASS"
             result["fail_reason"]  = None
             _log("Stage2 已禁用，综合结论: PASS")
+            result["timing"]["total"] = result["timing"]["stage1_total"]
+            self._persist_if_needed(frames, result)
             return result
 
         _log(f"开始 Stage2（帧[{best_idx}]）")
@@ -214,6 +237,11 @@ class InspectorPipeline:
             result["final_status"] = "FAIL"
             result["fail_reason"]  = "; ".join(r2["issues"]) or "Stage2 检测到表面缺陷"
 
+        result["timing"]["total"] = (
+            result["timing"].get("stage1_total", 0.0) +
+            result["timing"].get("stage2", 0.0)
+        )
+        self._persist_if_needed(frames, result)
         _log(f"综合结论: {result['final_status']}")
         return result
 
@@ -222,6 +250,7 @@ class InspectorPipeline:
     @staticmethod
     def _empty(reason: str) -> dict:
         return {
+            "product_id":     None,
             "final_status":   "FAIL",
             "fail_reason":    reason,
             "fail_frame_idx": None,
@@ -230,6 +259,42 @@ class InspectorPipeline:
             "stage2_result":  None,
             "timing":         {},
         }
+
+    def _persist_if_needed(self, frames: list[np.ndarray], result: dict) -> None:
+        if self._recorder is None:
+            return
+        product_id = result.get("product_id")
+        if not product_id:
+            return
+
+        sharpness_scores = [_laplacian_var(f) for f in frames] if frames else []
+        frame_rows: list[dict] = []
+        stage1_results = result.get("stage1_results", [])
+        for idx, s1 in enumerate(stage1_results):
+            frame_rows.append(
+                {
+                    "frame_id": f"B{product_id}-F{idx+1}",
+                    "frame_idx": idx,
+                    "sharpness": sharpness_scores[idx] if idx < len(sharpness_scores) else None,
+                    "stage1_status": s1.get("status"),
+                    "stage1_issues": s1.get("issues", []),
+                }
+            )
+
+        try:
+            self._recorder.save_inspection(
+                product_id=product_id,
+                view=self.view,
+                frame_rows=frame_rows,
+                stage2_result=result.get("stage2_result"),
+                final_status=result.get("final_status", "FAIL"),
+                fail_reason=result.get("fail_reason"),
+                sharpest_idx=result.get("sharpest_idx"),
+                timing=result.get("timing"),
+            )
+            _log(f"Stage3 SQL 已写入: product_id={product_id}")
+        except Exception as e:
+            _log(f"[警告] Stage3 SQL 写入失败: {e}")
 
     @staticmethod
     def load_calibration(view: str) -> list | None:
