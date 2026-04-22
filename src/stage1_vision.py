@@ -1,440 +1,637 @@
+"""
+Stage1 初筛检测器（视觉比对版）
+
+完整检测流程：
+  A. 图像质量门控（清晰度、分辨率、过曝、欠曝）
+  B. 最佳参考图选择（ORB 多模板匹配）
+  C. 产品定位（标定 ROI 优先；否则多尺度边缘模板匹配）
+  D. GrabCut 精细抠图（→ 产品 mask，消除背景干扰）
+  E. 塑料膜覆盖率检测（超阈值 → RETAKE）
+  F. Homography 对齐（测试图 ROI 对准参考图）
+  G. 差异图计算（仅在产品 mask 内）
+  H. 缺件/多件框选（严格限制在产品 mask 内）
+  I. 综合规则判定 → PASS / FAIL / RETAKE
+
+所有路径使用相对路径，兼容 Windows 和树莓派。
+"""
+
+from __future__ import annotations
+
+import os
+
 import cv2
 import numpy as np
-import os
-from .config import MIN_MATCH_COUNT
 
-# === 🛠️ 关键修复：支持中文路径的读取函数 ===
-def imread_safe(file_path):
-    """
-    解决 OpenCV 在 Windows 上无法读取中文路径的问题
-    """
+from .config import (
+    DIFF_THRESHOLD,
+    FILM_COVERAGE_THRESHOLD,
+    FILM_S_MAX,
+    FILM_V_MIN,
+    MAX_MISSING_COUNT,
+    MIN_DEFECT_BOX_AREA,
+    MIN_LOCALIZATION_SCORE,
+    MIN_MATCH_COUNT,
+    MIN_RESOLUTION,
+    MIN_SHARPNESS,
+    OVEREXPOSE_RATIO_THRESHOLD,
+    UNDEREXPOSE_RATIO_THRESHOLD,
+)
+
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+
+def imread_safe(file_path: str) -> np.ndarray | None:
+    """支持中文路径的图像读取（灰度）。"""
     try:
-        # 使用 numpy 读取文件流，再解码，绕过 OpenCV 的路径限制
-        img_array = np.fromfile(file_path, dtype=np.uint8)
-        img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE) # 直接读为灰度
-        return img
+        arr = np.fromfile(file_path, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
     except Exception as e:
-        print(f"[读取失败] {file_path}: {e}")
+        print(f"[读取失败-灰度] {file_path}: {e}")
         return None
 
-class Stage1Detector:
-    def __init__(self, ref_folder_path):
-        """
-        初始化检测器，加载指定文件夹下的所有参考图
-        """
-        self.reference_features = [] # 存储多张金样的特征
-        
-        # 路径标准化，防止斜杠问题
-        ref_folder_path = os.path.normpath(ref_folder_path)
 
-        if not os.path.exists(ref_folder_path):
-            print(f"[Stage1] [错误] 找不到参考图文件夹: {ref_folder_path}")
+def _imread_color_safe(file_path: str) -> np.ndarray | None:
+    """支持中文路径的图像读取（彩色 BGR）。"""
+    try:
+        arr = np.fromfile(file_path, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        print(f"[读取失败-彩色] {file_path}: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 主检测器
+# ---------------------------------------------------------------------------
+
+class Stage1Detector:
+    """
+    Stage1 初筛检测器。
+
+    参数
+    ----
+    ref_folder_path : str
+        标准参考图文件夹（相对或绝对路径均可）。
+        文件夹内直接放 PNG/JPG/BMP 图片（同一视角）。
+    """
+
+    def __init__(self, ref_folder_path: str) -> None:
+        self.reference_data: list[dict] = []
+        self.orb = cv2.ORB_create(nfeatures=1500)
+
+        ref_folder_path = os.path.normpath(ref_folder_path)
+        if not os.path.isdir(ref_folder_path):
+            print(f"[Stage1] [错误] 参考图文件夹不存在: {ref_folder_path}")
             return
 
-        # 1. 初始化 ORB
-        self.orb = cv2.ORB_create(nfeatures=1000)
-
-        # 2. 遍历文件夹读取所有图片
-        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp')
-        print(f"[Stage1] 正在加载多模板金样库: {ref_folder_path} ...")
-        
+        valid_exts = (".jpg", ".jpeg", ".png", ".bmp")
+        print(f"[Stage1] 正在加载标准图库: {ref_folder_path} ...")
         count = 0
-        if os.path.isdir(ref_folder_path):
-            files = os.listdir(ref_folder_path)
-            for filename in files:
-                if filename.lower().endswith(valid_extensions):
-                    img_path = os.path.join(ref_folder_path, filename)
-                    
-                    # ⚠️ 使用修复后的读取函数
-                    img = imread_safe(img_path)
-                    
-                    if img is not None:
-                        # 计算特征
-                        kp, des = self.orb.detectAndCompute(img, None)
-                        if des is not None:
-                            self.reference_features.append({
-                                'kp': kp, 'des': des, 'img': img, 'name': filename
-                            })
-                            count += 1
-                    else:
-                        print(f"[警告] 无法读取金样图片 (可能是路径或格式问题): {filename}")
-        else:
-             print(f"[Stage1] [错误] 提供给 Stage1 的路径不是一个文件夹！")
-
-        print(f"[Stage1] 初始化完成。成功加载 {count} 张参考标准图。")
-
-    def check_integrity(self, target_img_path):
-        """
-        一级检测：多模板匹配逻辑
-        """
-        # 路径标准化
-        target_img_path = os.path.normpath(target_img_path)
-
-        if not self.reference_features:
-            return False, "Init Failed (No Ref Images Loaded)", None
-
-        # ⚠️ 使用修复后的读取函数
-        target_img = imread_safe(target_img_path)
-        
-        if target_img is None:
-            return False, "Image Load Error (Check Path/Chinese characters)", None
-
-        # 2. 计算待测图特征
-        kp_target, des_target = self.orb.detectAndCompute(target_img, None)
-        if des_target is None or len(kp_target) == 0:
-            return False, "No features in target", target_img
-
-        # 3. 轮询匹配 (Multi-template Matching)
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        
-        best_match_count = -1
-        best_ref_data = None
-        best_matches_list = []
-
-        # 遍历每一张金样
-        for ref_data in self.reference_features:
-            if ref_data['des'] is None: continue # 跳过无效特征
-            
-            matches = bf.match(ref_data['des'], des_target)
-            matches = sorted(matches, key=lambda x: x.distance)
-            
-            # 取前 15% 优质点
-            keep_percent = 0.15
-            if len(matches) > 0:
-                good_matches = matches[:int(len(matches) * keep_percent)]
-                current_count = len(good_matches)
-            else:
-                current_count = 0
-            
-            if current_count > best_match_count:
-                best_match_count = current_count
-                best_ref_data = ref_data
-                best_matches_list = good_matches
-
-        # 4. 绘图
-        debug_img = None
-        if best_ref_data is not None and target_img is not None:
-            debug_img = cv2.drawMatches(best_ref_data['img'], best_ref_data['kp'], 
-                                        target_img, kp_target, 
-                                        best_matches_list, None, flags=2)
-
-        # 5. 判定
-        matched_name = best_ref_data['name'] if best_ref_data else "None"
-        print(f"   >>> [调试] 最佳匹配金样: {matched_name} | 匹配点数: {best_match_count}")
-        
-        if best_match_count < MIN_MATCH_COUNT:
-            return False, f"FAIL: Mismatch (Best={best_match_count})", debug_img
-        else:
-            return True, f"PASS: Integrity OK (Best={best_match_count})", debug_img
-
-    def _evaluate_roi_quality(self, roi_bgr):
-        """
-        评估 ROI 图像质量，用于判断覆膜反光/虚焦/纹理过弱等问题。
-        """
-        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-        # 纹理复杂度：边缘占比过低往往意味着模糊、过曝、覆膜强反光或拍摄角度不佳
-        edges = cv2.Canny(gray, 80, 180)
-        texture_ratio = float(np.count_nonzero(edges)) / float(edges.size + 1e-6)
-
-        hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-        h, s, v = cv2.split(hsv)
-        _ = h  # 避免未使用变量告警
-        # 反光粗略指标：高亮且低饱和像素占比
-        highlight_mask = ((v > 220) & (s < 45)).astype(np.uint8)
-        reflection_ratio = float(np.count_nonzero(highlight_mask)) / float(highlight_mask.size + 1e-6)
-
-        return {
-            "sharpness": sharpness,
-            "texture_ratio": texture_ratio,
-            "reflection_ratio": reflection_ratio
-        }
-
-    def _simple_similarity(self, ref_gray, aligned_gray):
-        """
-        计算简化版结构相似度（0~1），避免依赖额外第三方库。
-        """
-        abs_diff = cv2.absdiff(ref_gray, aligned_gray)
-        norm_mean = float(np.mean(abs_diff)) / 255.0
-        return max(0.0, 1.0 - norm_mean)
-
-    def _extract_product_mask(self, gray_img):
-        """
-        从图像中提取产品主体掩膜（最大连通域），用于材料缺失判定。
-        """
-        blur = cv2.GaussianBlur(gray_img, (5, 5), 0)
-        # OTSU 自动阈值，适应不同光照
-        _, bin_img = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # 兼容明暗背景：选择面积更大的前景解释
-        fg_area = int(np.count_nonzero(bin_img))
-        inv = cv2.bitwise_not(bin_img)
-        inv_area = int(np.count_nonzero(inv))
-        if inv_area > fg_area:
-            bin_img = inv
-
-        kernel = np.ones((5, 5), np.uint8)
-        bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, kernel, iterations=1)
-        bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        contours, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return np.zeros_like(gray_img, dtype=np.uint8)
-
-        max_cnt = max(contours, key=cv2.contourArea)
-        mask = np.zeros_like(gray_img, dtype=np.uint8)
-        cv2.drawContours(mask, [max_cnt], -1, 255, thickness=-1)
-        return mask
-
-    def _clamp_bbox(self, x1, y1, x2, y2, w_img, h_img):
-        x1 = max(0, min(int(x1), w_img - 1))
-        y1 = max(0, min(int(y1), h_img - 1))
-        x2 = max(x1 + 1, min(int(x2), w_img))
-        y2 = max(y1 + 1, min(int(y2), h_img))
-        return x1, y1, x2, y2
-
-    def _multiscale_template_localize(self, target_gray):
-        """
-        多尺度模板匹配做粗定位，优先保证产品框稳定。
-        返回:
-        {
-            "score": float,
-            "ref_data": dict,
-            "bbox": [x1, y1, x2, y2],
-            "scale": float
-        }
-        """
-        h_t, w_t = target_gray.shape[:2]
-        target_blur = cv2.GaussianBlur(target_gray, (5, 5), 0)
-        target_edge = cv2.Canny(target_blur, 50, 150)
-        scales = [0.75, 0.85, 1.0, 1.15, 1.3]
-
-        best = {"score": -1.0, "ref_data": None, "bbox": None, "scale": 1.0}
-        for ref_data in self.reference_features:
-            ref_gray = ref_data["img"]
-            h_r0, w_r0 = ref_gray.shape[:2]
-            for scale in scales:
-                w_r = int(w_r0 * scale)
-                h_r = int(h_r0 * scale)
-                if w_r < 80 or h_r < 80:
-                    continue
-                if w_r >= w_t or h_r >= h_t:
-                    continue
-
-                ref_resized = cv2.resize(ref_gray, (w_r, h_r), interpolation=cv2.INTER_AREA)
-                ref_edge = cv2.Canny(cv2.GaussianBlur(ref_resized, (5, 5), 0), 50, 150)
-                match = cv2.matchTemplate(target_edge, ref_edge, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(match)
-
-                if max_val > best["score"]:
-                    x1, y1 = max_loc
-                    x2, y2 = x1 + w_r, y1 + h_r
-                    x1, y1, x2, y2 = self._clamp_bbox(x1, y1, x2, y2, w_t, h_t)
-                    best = {
-                        "score": float(max_val),
-                        "ref_data": ref_data,
-                        "bbox": [x1, y1, x2, y2],
-                        "scale": scale
-                    }
-        return best
-
-    def _detect_missing_regions(self, ref_gray, aligned_target_gray):
-        """
-        缺件定义：参考中存在材料，但当前样品对应区域材料缺失。
-        通过主体掩膜差异 (ref_mask - target_mask) 定位缺失区域。
-        """
-        ref_mask = self._extract_product_mask(ref_gray)
-        tgt_mask = self._extract_product_mask(aligned_target_gray)
-
-        # 只保留“参考有、当前无”的区域 = 材料缺失候选
-        binary = cv2.bitwise_and(ref_mask, cv2.bitwise_not(tgt_mask))
-
-        kernel = np.ones((5, 5), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        h, w = ref_gray.shape[:2]
-        area_min = max(380, int(0.0018 * w * h))
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        boxes = []
-        for cnt in contours:
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            area = bw * bh
-            if area < area_min:
+        for fname in sorted(os.listdir(ref_folder_path)):
+            if not fname.lower().endswith(valid_exts):
                 continue
-            # 细长噪声过滤 + 极端大区域过滤
-            ratio = max(bw / (bh + 1e-6), bh / (bw + 1e-6))
-            if ratio > 10:
+            fpath = os.path.join(ref_folder_path, fname)
+            gray = imread_safe(fpath)
+            bgr  = _imread_color_safe(fpath)
+            if gray is None or bgr is None:
+                print(f"  [警告] 无法读取: {fname}")
                 continue
-            if area > int(0.35 * w * h):
+            kp, des = self.orb.detectAndCompute(gray, None)
+            if des is None:
                 continue
-            boxes.append((x, y, bw, bh))
-        return boxes
+            self.reference_data.append(
+                {"name": fname, "gray": gray, "bgr": bgr, "kp": kp, "des": des}
+            )
+            count += 1
+        print(f"[Stage1] 初始化完成，成功加载 {count} 张标准图。")
+
+    # ------------------------------------------------------------------
+    # 公开接口
+    # ------------------------------------------------------------------
 
     def inspect_with_localization(
         self,
         target_input,
-        min_match_count=None,
-        min_localization_score=0.20,
-        min_similarity_fail=0.72,
-        missing_regions_fail_count=2
-    ):
+        min_match_count: int | None = None,
+        min_localization_score: float | None = None,
+        min_similarity_fail: float = 0.70,
+        missing_regions_fail_count: int | None = None,
+        calibrated_bbox: list | None = None,
+    ) -> dict:
         """
-        新版 Stage1 初筛：
-        1) 多模板匹配并选择最佳模板
-        2) 通过单应性框出产品区域
-        3) 给出初筛结论与问题列表
-        4) 标注疑似缺件/少件区域
+        完整初筛流程。
 
-        :param target_input: 图片路径(str) 或 BGR图(np.ndarray)
-        :param min_match_count: 可动态覆盖阈值
-        :return: dict
+        参数
+        ----
+        target_input : str | np.ndarray
+            图片路径或已加载的 BGR/灰度图。
+        calibrated_bbox : [x1, y1, x2, y2] | None
+            外部传入的标定 ROI（像素坐标）。传入时跳过模板匹配。
+
+        返回
+        ----
+        dict，含以下关键字段：
+            status          : "PASS" | "FAIL" | "RETAKE"
+            issues          : list[str]
+            warnings        : list[str]
+            film_coverage   : float
+            similarity      : float
+            missing_regions : list[[x1,y1,x2,y2]]
+            extra_regions   : list[[x1,y1,x2,y2]]
+            annotated_image : np.ndarray
+            cutout_image    : np.ndarray
+            quality         : dict
+            bbox            : list
+            localization_score : float
+            best_ref_name   : str | None
+            score           : int
         """
-        threshold = int(min_match_count if min_match_count is not None else MIN_MATCH_COUNT)
-        result = {
-            "pass": False,
-            "status": "FAIL",
-            "score": 0,
-            "threshold": threshold,
-            "localization_score": 0.0,
-            "best_ref_name": None,
-            "bbox": None,
-            "polygon": None,
-            "similarity": 0.0,
-            "quality": {},
-            "issues": [],
-            "warnings": [],
-            "missing_regions": [],
-            "annotated_image": None
-        }
+        threshold      = int(min_match_count or MIN_MATCH_COUNT)
+        loc_thresh     = float(min_localization_score or MIN_LOCALIZATION_SCORE)
+        missing_thresh = int(missing_regions_fail_count or MAX_MISSING_COUNT)
 
-        if not self.reference_features:
-            result["issues"].append("参考图未加载成功")
+        result = self._empty_result(threshold)
+
+        if not self.reference_data:
+            result["issues"].append("标准图未加载成功，请检查标准图库路径")
             return result
 
         # 读取目标图
-        if isinstance(target_input, str):
-            target_gray = imread_safe(os.path.normpath(target_input))
-            if target_gray is None:
-                result["issues"].append("待测图读取失败")
-                return result
-            target_bgr = cv2.cvtColor(target_gray, cv2.COLOR_GRAY2BGR)
-        else:
-            if target_input is None or not hasattr(target_input, "shape"):
-                result["issues"].append("待测图无效")
-                return result
-            if len(target_input.shape) == 2:
-                target_gray = target_input.copy()
-                target_bgr = cv2.cvtColor(target_gray, cv2.COLOR_GRAY2BGR)
-            else:
-                target_bgr = target_input.copy()
-                target_gray = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2GRAY)
+        target_gray, target_bgr = self._load_target(target_input)
+        if target_gray is None:
+            result["issues"].append("待测图读取失败，请检查路径或图片格式")
+            return result
 
         h_img, w_img = target_gray.shape[:2]
         vis = target_bgr.copy()
 
-        # Step 1: 先用模板匹配稳定框产品，避免先前 homography 容易跑偏到背景
-        coarse = self._multiscale_template_localize(target_gray)
-        if coarse["ref_data"] is None or coarse["bbox"] is None:
-            result["issues"].append("无法定位产品主体，请调整摆放和拍摄位置")
-            result["annotated_image"] = vis
-            return result
-
-        x1, y1, x2, y2 = coarse["bbox"]
-        result["bbox"] = [x1, y1, x2, y2]
-        result["localization_score"] = float(coarse["score"])
-        result["best_ref_name"] = coarse["ref_data"]["name"]
-        result["polygon"] = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-
-        # 只基于框内区域做后续判定
-        roi_gray = target_gray[y1:y2, x1:x2]
-        roi_bgr = target_bgr[y1:y2, x1:x2]
-        if roi_gray.size == 0:
-            result["issues"].append("产品框无效，请调整相机与产品位置")
-            result["annotated_image"] = vis
-            return result
-
-        ref_gray = coarse["ref_data"]["img"]
-        h_ref, w_ref = ref_gray.shape[:2]
-        roi_resized = cv2.resize(roi_gray, (w_ref, h_ref), interpolation=cv2.INTER_LINEAR)
-
-        # Step 2: 仅 ROI 内做特征得分和相似度
-        kp_roi, des_roi = self.orb.detectAndCompute(roi_gray, None)
-        kp_ref, des_ref = self.orb.detectAndCompute(ref_gray, None)
-        if des_roi is None or des_ref is None:
-            result["score"] = 0
-            result["warnings"].append("框内特征较少，建议补光并减少反光")
-        else:
-            bf_local = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-            matches = bf_local.match(des_ref, des_roi)
-            matches = sorted(matches, key=lambda m: m.distance)
-            keep_n = max(8, int(len(matches) * 0.20))
-            result["score"] = int(min(len(matches), keep_n))
-
-        similarity = self._simple_similarity(ref_gray, roi_resized)
-        result["similarity"] = float(similarity)
-
-        # Step 3: 缺件/少件疑似区域 (仅框内比较)
-        missing_boxes_ref = self._detect_missing_regions(ref_gray, roi_resized)
-        for (mx, my, mw, mh) in missing_boxes_ref:
-            # 从参考平面映射到 ROI，再映射回整图坐标
-            rx1 = x1 + int(mx * (x2 - x1) / float(w_ref))
-            ry1 = y1 + int(my * (y2 - y1) / float(h_ref))
-            rx2 = x1 + int((mx + mw) * (x2 - x1) / float(w_ref))
-            ry2 = y1 + int((my + mh) * (y2 - y1) / float(h_ref))
-            rx1, ry1, rx2, ry2 = self._clamp_bbox(rx1, ry1, rx2, ry2, w_img, h_img)
-            if (rx2 - rx1) * (ry2 - ry1) < 120:
-                continue
-            result["missing_regions"].append([rx1, ry1, rx2, ry2])
-            cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
-            cv2.putText(vis, "Missing/Suspect", (rx1, max(20, ry1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-
-        # Step 4: 质量评估（严格只看产品框内）
-        quality = self._evaluate_roi_quality(roi_bgr)
+        # ── A. 图像质量门控 ────────────────────────────────────────────
+        quality = self._evaluate_quality(target_bgr)
         result["quality"] = quality
 
-        # Step 5: 阻断项/告警项分离，降低误杀正常品
-        if result["localization_score"] < float(min_localization_score):
-            result["issues"].append(
-                f"产品定位置信度低 ({result['localization_score']:.2f})，请调整摆放后重拍"
-            )
-        if result["score"] < max(8, int(threshold * 0.60)) and similarity < float(min_similarity_fail):
-            result["issues"].append(
-                f"框内匹配与相似度均偏低 (match={result['score']}, sim={similarity:.2f})"
-            )
-        if len(result["missing_regions"]) >= int(missing_regions_fail_count) and similarity < 0.80:
-            result["issues"].append(f"发现 {len(result['missing_regions'])} 处疑似缺件/少件区域")
-
-        if quality["sharpness"] < 22:
-            result["warnings"].append(f"清晰度偏低 (sharpness={quality['sharpness']:.1f})")
-        if quality["texture_ratio"] < 0.012:
+        if quality["sharpness"] < MIN_SHARPNESS:
             result["warnings"].append(
-                f"纹理偏弱 (texture={quality['texture_ratio']:.3f})，疑似覆膜/过曝"
+                f"图像清晰度不足 (sharpness={quality['sharpness']:.1f})，建议重拍"
             )
-        if quality["reflection_ratio"] > 0.35:
-            result["warnings"].append(
-                f"反光偏强 (reflection={quality['reflection_ratio']:.3f})，疑似塑料膜干扰"
+        if min(h_img, w_img) < MIN_RESOLUTION:
+            result["issues"].append(
+                f"分辨率不足 ({w_img}×{h_img})，最低要求 {MIN_RESOLUTION}px"
             )
-        if len(result["missing_regions"]) == 1 and similarity >= 0.80:
-            result["warnings"].append("存在 1 处轻微差异区域，建议人工复核")
+            result["status"] = "RETAKE"
+            result["annotated_image"] = self._put_status(vis, "RETAKE", result["issues"][-1])
+            return result
 
-        result["pass"] = len(result["issues"]) == 0
-        result["status"] = "PASS" if result["pass"] else "FAIL"
-        status_color = (0, 180, 0) if result["pass"] else (0, 0, 255)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 215, 255), 2)
-        cv2.putText(vis, "Product ROI", (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2)
-        cv2.putText(
-            vis,
-            f"Stage1 {result['status']} | loc={result['localization_score']:.2f} | match={result['score']} | sim={result['similarity']:.2f}",
-            (12, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            status_color,
-            2
+        # 过曝 / 欠曝检测
+        if quality.get("overexpose_ratio", 0) > OVEREXPOSE_RATIO_THRESHOLD:
+            msg = (
+                f"图像过曝 ({quality['overexpose_ratio']*100:.1f}% 像素亮度>240)，"
+                "请降低相机曝光或调整补光"
+            )
+            result["issues"].append(msg)
+            result["status"] = "RETAKE"
+            result["annotated_image"] = self._put_status(vis, "RETAKE", msg)
+            return result
+        if quality.get("underexpose_ratio", 0) > UNDEREXPOSE_RATIO_THRESHOLD:
+            msg = (
+                f"图像欠曝 ({quality['underexpose_ratio']*100:.1f}% 像素亮度<25)，"
+                "请改善照明条件"
+            )
+            result["issues"].append(msg)
+            result["status"] = "RETAKE"
+            result["annotated_image"] = self._put_status(vis, "RETAKE", msg)
+            return result
+
+        # ── B. 最佳参考图选择（ORB） ───────────────────────────────────
+        best_ref, match_score = self._select_best_reference(target_gray)
+        result["score"] = match_score
+        if best_ref is None:
+            result["issues"].append("无法匹配任何参考图，请确认检测视角是否正确")
+            result["status"] = "RETAKE"
+            result["annotated_image"] = self._put_status(vis, "RETAKE", result["issues"][-1])
+            return result
+        result["best_ref_name"] = best_ref["name"]
+
+        # ── C. 产品定位 ────────────────────────────────────────────────
+        if calibrated_bbox is not None:
+            bbox = self._clamp(*calibrated_bbox, w_img, h_img)
+            result["localization_score"] = 1.0
+        else:
+            coarse = self._multiscale_locate(target_gray, best_ref["gray"])
+            result["localization_score"] = coarse["score"]
+            if coarse["score"] < loc_thresh or coarse["bbox"] is None:
+                result["issues"].append(
+                    f"产品定位失败 (score={coarse['score']:.3f})，"
+                    "建议使用 ROI 标定功能固定产品区域"
+                )
+                result["status"] = "RETAKE"
+                result["annotated_image"] = self._put_status(vis, "RETAKE", result["issues"][-1])
+                return result
+            bbox = coarse["bbox"]
+
+        result["bbox"] = bbox
+        x1, y1, x2, y2 = bbox
+        _bbox_from_calib = calibrated_bbox is not None   # 记录是否来自标定
+
+        # ── D. GrabCut 精细抠图 → 产品 mask ───────────────────────────
+        product_mask = self._grabcut_mask(target_bgr, bbox)
+        result["cutout_image"] = self._make_white_bg(target_gray, product_mask)
+
+        # 用 GrabCut mask 轮廓重新计算紧致 bbox
+        # 注意：若 bbox 来自手动标定，则不用 GrabCut 结果覆盖，保持标定坐标
+        if not _bbox_from_calib:
+            cts_pm, _ = cv2.findContours(product_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cts_pm:
+                mc_pm = max(cts_pm, key=cv2.contourArea)
+                mx, my, mw, mh = cv2.boundingRect(mc_pm)
+                pad = max(4, int(min(mw, mh) * 0.02))
+                mx = max(0, mx - pad);  my = max(0, my - pad)
+                mw = min(w_img - mx, mw + 2 * pad)
+                mh = min(h_img - my, mh + 2 * pad)
+                bbox = [mx, my, mx + mw, my + mh]
+                x1, y1, x2, y2 = bbox
+                result["bbox"] = bbox
+
+        # ── E. 塑料膜覆盖率检测 ────────────────────────────────────────
+        film_ratio, film_mask = self._detect_film(target_bgr, product_mask)
+        result["film_coverage"] = float(film_ratio)
+
+        if film_ratio > FILM_COVERAGE_THRESHOLD:
+            result["issues"].append(
+                f"塑料膜覆盖过大 ({film_ratio*100:.1f}% > {FILM_COVERAGE_THRESHOLD*100:.0f}%)，"
+                "覆膜遮挡产品，无法进行细筛"
+            )
+            result["status"] = "RETAKE"
+            result["annotated_image"] = self._draw_film_warning(vis, film_mask, film_ratio)
+            return result
+        elif film_ratio > 0.10:
+            result["warnings"].append(
+                f"存在塑料膜覆盖 ({film_ratio*100:.1f}%)，细筛时注意干扰"
+            )
+
+        # ── F. ROI 提取 + Homography 对齐 ─────────────────────────────
+        ref_gray = best_ref["gray"]
+        h_ref, w_ref = ref_gray.shape[:2]
+        roi_gray = target_gray[y1:y2, x1:x2]
+        if roi_gray.size == 0:
+            result["issues"].append("产品 ROI 区域无效，请重新摆放")
+            result["status"] = "RETAKE"
+            result["annotated_image"] = vis
+            return result
+
+        roi_resized = cv2.resize(roi_gray, (w_ref, h_ref), interpolation=cv2.INTER_LINEAR)
+        aligned_roi, _ = self._align_to_reference(ref_gray, roi_resized)
+        result["similarity"] = float(self._simple_similarity(ref_gray, aligned_roi))
+
+        # ── G. 差异图（仅在产品 mask 内） ─────────────────────────────
+        roi_pm = product_mask[y1:y2, x1:x2]
+        if roi_pm.size == 0:
+            roi_pm = np.ones((y2 - y1, x2 - x1), np.uint8) * 255
+        ref_product_mask = cv2.resize(
+            roi_pm, (w_ref, h_ref), interpolation=cv2.INTER_NEAREST
         )
+        missing_boxes_roi, extra_boxes_roi = self._find_diff_boxes(
+            ref_gray, aligned_roi, ref_product_mask, ref_product_mask
+        )
+
+        # ── H. 框坐标映射回整图，严格限制在产品 mask 内 ───────────────
+        def map_to_full(bx1, by1, bx2, by2):
+            rx1 = x1 + int(bx1 * (x2 - x1) / max(w_ref, 1))
+            ry1 = y1 + int(by1 * (y2 - y1) / max(h_ref, 1))
+            rx2 = x1 + int(bx2 * (x2 - x1) / max(w_ref, 1))
+            ry2 = y1 + int(by2 * (y2 - y1) / max(h_ref, 1))
+            rx1, ry1, rx2, ry2 = self._clamp(rx1, ry1, rx2, ry2, w_img, h_img)
+            if (rx2 - rx1) * (ry2 - ry1) < 50:
+                return None
+            cx, cy = (rx1 + rx2) // 2, (ry1 + ry2) // 2
+            if product_mask[cy, cx] == 0:
+                return None
+            return [rx1, ry1, rx2, ry2]
+
+        for idx, box in enumerate(missing_boxes_roi):
+            mapped = map_to_full(*box)
+            if mapped is None:
+                continue
+            result["missing_regions"].append(mapped)
+            rx1, ry1, rx2, ry2 = mapped
+            cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), (0, 0, 220), 2)
+            cv2.putText(
+                vis, f"异常{idx+1}", (rx1, max(18, ry1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 0, 220), 2,
+            )
+
+        for idx, box in enumerate(extra_boxes_roi):
+            mapped = map_to_full(*box)
+            if mapped is None:
+                continue
+            result["extra_regions"].append(mapped)
+            rx1, ry1, rx2, ry2 = mapped
+            cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), (0, 140, 255), 2)
+            cv2.putText(
+                vis, f"多余{idx+1}", (rx1, max(18, ry1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 140, 255), 2,
+            )
+
+        # ── I. 综合判定 ────────────────────────────────────────────────
+        if len(result["missing_regions"]) >= missing_thresh:
+            result["issues"].append(
+                f"发现 {len(result['missing_regions'])} 处异常区域（阈值={missing_thresh}）"
+            )
+        if len(result["extra_regions"]) > 0:
+            result["issues"].append(
+                f"发现 {len(result['extra_regions'])} 处疑似多余区域"
+            )
+        if result["similarity"] < min_similarity_fail:
+            result["warnings"].append(
+                f"与标准件相似度偏低 ({result['similarity']:.2f} < {min_similarity_fail})"
+            )
+
+        result["pass"]   = len(result["issues"]) == 0
+        result["status"] = "PASS" if result["pass"] else "FAIL"
+        status_color     = (0, 180, 0) if result["pass"] else (0, 0, 255)
+
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 215, 255), 2)
+        cv2.putText(
+            vis, "Product ROI", (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2,
+        )
+        status_text = (
+            f"Stage1 {result['status']} | "
+            f"film={result['film_coverage']*100:.1f}% | "
+            f"sim={result['similarity']:.2f} | "
+            f"miss={len(result['missing_regions'])} | "
+            f"extra={len(result['extra_regions'])}"
+        )
+        cv2.putText(
+            vis, status_text, (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.60, status_color, 2,
+        )
+
         result["annotated_image"] = vis
         return result
+
+    def check_integrity(self, target_img_path: str):
+        """向后兼容接口，返回 (bool, message, debug_img)。"""
+        res = self.inspect_with_localization(target_img_path)
+        passed = res["status"] == "PASS"
+        msg    = res["issues"][0] if res["issues"] else res["status"]
+        return passed, msg, res.get("annotated_image")
+
+    # ------------------------------------------------------------------
+    # 私有方法
+    # ------------------------------------------------------------------
+
+    def _empty_result(self, threshold: int) -> dict:
+        return {
+            "pass":               False,
+            "status":             "FAIL",
+            "score":              0,
+            "threshold":          threshold,
+            "localization_score": 0.0,
+            "best_ref_name":      None,
+            "bbox":               None,
+            "polygon":            None,
+            "similarity":         0.0,
+            "film_coverage":      0.0,
+            "quality":            {},
+            "issues":             [],
+            "warnings":           [],
+            "missing_regions":    [],
+            "extra_regions":      [],
+            "annotated_image":    None,
+            "cutout_image":       None,
+        }
+
+    def _load_target(self, target_input) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if isinstance(target_input, str):
+            gray = imread_safe(os.path.normpath(target_input))
+            if gray is None:
+                return None, None
+            bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        elif isinstance(target_input, np.ndarray):
+            if len(target_input.shape) == 2:
+                gray = target_input.copy()
+                bgr  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            else:
+                bgr  = target_input.copy()
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        else:
+            return None, None
+        return gray, bgr
+
+    def _evaluate_quality(self, bgr: np.ndarray) -> dict:
+        gray             = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        sharpness        = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        edges            = cv2.Canny(gray, 80, 180)
+        texture_ratio    = float(np.count_nonzero(edges)) / float(edges.size + 1e-6)
+        hsv              = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        _, s, v          = cv2.split(hsv)
+        highlight        = (v > 220) & (s < 45)
+        reflection_ratio = float(np.count_nonzero(highlight)) / float(highlight.size + 1e-6)
+        total            = float(gray.size + 1e-6)
+        overexpose_ratio  = float(np.count_nonzero(gray > 240)) / total
+        underexpose_ratio = float(np.count_nonzero(gray < 25))  / total
+        return {
+            "sharpness":         sharpness,
+            "texture_ratio":     texture_ratio,
+            "reflection_ratio":  reflection_ratio,
+            "overexpose_ratio":  overexpose_ratio,
+            "underexpose_ratio": underexpose_ratio,
+        }
+
+    def _select_best_reference(self, target_gray: np.ndarray) -> tuple[dict | None, int]:
+        kp_tgt, des_tgt = self.orb.detectAndCompute(target_gray, None)
+        if des_tgt is None:
+            return None, 0
+        bf         = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        best_ref   = None
+        best_count = 0
+        for ref in self.reference_data:
+            try:
+                matches = bf.knnMatch(ref["des"], des_tgt, k=2)
+            except cv2.error:
+                continue
+            good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+            if len(good) > best_count:
+                best_count = len(good)
+                best_ref   = ref
+        return best_ref, best_count
+
+    def _multiscale_locate(self, target_gray: np.ndarray, ref_gray: np.ndarray) -> dict:
+        h_t, w_t   = target_gray.shape[:2]
+        h_r0, w_r0 = ref_gray.shape[:2]
+        target_edge = cv2.Canny(cv2.GaussianBlur(target_gray, (5, 5), 0), 50, 150)
+        best = {"score": -1.0, "bbox": None}
+        for scale in [0.5, 0.65, 0.75, 0.9, 1.0, 1.1, 1.25, 1.4]:
+            w_r, h_r = int(w_r0 * scale), int(h_r0 * scale)
+            if w_r < 60 or h_r < 60 or w_r >= w_t or h_r >= h_t:
+                continue
+            ref_resized = cv2.resize(ref_gray, (w_r, h_r), interpolation=cv2.INTER_AREA)
+            ref_edge    = cv2.Canny(cv2.GaussianBlur(ref_resized, (5, 5), 0), 50, 150)
+            res         = cv2.matchTemplate(target_edge, ref_edge, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            if max_val > best["score"]:
+                x1, y1 = max_loc
+                x2, y2 = x1 + w_r, y1 + h_r
+                best   = {
+                    "score": float(max_val),
+                    "bbox":  self._clamp(x1, y1, x2, y2, w_t, h_t),
+                }
+        return best
+
+    def _grabcut_mask(self, bgr: np.ndarray, bbox: list) -> np.ndarray:
+        h, w            = bgr.shape[:2]
+        x1, y1, x2, y2 = bbox
+        bw, bh          = x2 - x1, y2 - y1
+
+        if bw < 20 or bh < 20:
+            mask = np.zeros((h, w), np.uint8)
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            return mask
+
+        roi_bgr  = bgr[y1:y2, x1:x2].copy()
+        rh, rw   = roi_bgr.shape[:2]
+        max_side = 512
+        scale    = min(max_side / max(rw, rh), 1.0)
+        roi_small = cv2.resize(roi_bgr, (int(rw * scale), int(rh * scale))) if scale < 1.0 else roi_bgr
+        sh, sw   = roi_small.shape[:2]
+
+        margin  = max(5, int(min(sw, sh) * 0.10))
+        rect    = (margin, margin, sw - 2 * margin, sh - 2 * margin)
+        gc_mask = np.zeros((sh, sw), np.uint8)
+        bgd_mdl = np.zeros((1, 65), np.float64)
+        fgd_mdl = np.zeros((1, 65), np.float64)
+        try:
+            cv2.grabCut(roi_small, gc_mask, rect, bgd_mdl, fgd_mdl, 3, cv2.GC_INIT_WITH_RECT)
+            fg_small = np.where(
+                (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
+            ).astype(np.uint8)
+        except Exception:
+            fg_small = np.ones((sh, sw), np.uint8) * 255
+
+        fg_roi = cv2.resize(fg_small, (rw, rh), interpolation=cv2.INTER_NEAREST) if scale < 1.0 else fg_small
+
+        kernel = np.ones((7, 7), np.uint8)
+        fg_roi = cv2.morphologyEx(fg_roi, cv2.MORPH_CLOSE, kernel, iterations=2)
+        fg_roi = cv2.morphologyEx(fg_roi, cv2.MORPH_OPEN,  kernel, iterations=1)
+
+        contours, _ = cv2.findContours(fg_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        clean_roi   = np.zeros_like(fg_roi)
+        if contours:
+            max_cnt = max(contours, key=cv2.contourArea)
+            cv2.drawContours(clean_roi, [max_cnt], -1, 255, -1)
+        else:
+            clean_roi[:] = 255
+
+        full_mask = np.zeros((h, w), np.uint8)
+        full_mask[y1:y2, x1:x2] = clean_roi
+        return full_mask
+
+    def _detect_film(self, bgr: np.ndarray, product_mask: np.ndarray) -> tuple[float, np.ndarray]:
+        hsv          = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        _, s, v      = cv2.split(hsv)
+        film_pixels  = ((v > FILM_V_MIN) & (s < FILM_S_MAX)).astype(np.uint8) * 255
+        film_product = cv2.bitwise_and(film_pixels, product_mask)
+        prod_area    = max(int(np.count_nonzero(product_mask)), 1)
+        film_area    = int(np.count_nonzero(film_product))
+        return film_area / prod_area, film_product
+
+    def _align_to_reference(self, ref_gray: np.ndarray, test_gray: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+        kp1, des1 = self.orb.detectAndCompute(ref_gray,  None)
+        kp2, des2 = self.orb.detectAndCompute(test_gray, None)
+        if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+            return test_gray, None
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        try:
+            raw  = bf.knnMatch(des1, des2, k=2)
+        except cv2.error:
+            return test_gray, None
+        good = [m for m, n in raw if m.distance < 0.75 * n.distance]
+        if len(good) < 4:
+            return test_gray, None
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        H, _    = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+        if H is None:
+            return test_gray, None
+        h, w    = ref_gray.shape[:2]
+        aligned = cv2.warpPerspective(test_gray, H, (w, h))
+        return aligned, H
+
+    def _find_diff_boxes(
+        self,
+        ref_gray:  np.ndarray,
+        test_gray: np.ndarray,
+        ref_mask:  np.ndarray,
+        test_mask: np.ndarray,
+    ) -> tuple[list, list]:
+        h, w     = ref_gray.shape[:2]
+        area_min = max(MIN_DEFECT_BOX_AREA, int(0.0012 * w * h))
+
+        valid_mask = cv2.bitwise_and(ref_mask, test_mask)
+        abs_diff   = cv2.absdiff(ref_gray, test_gray)
+        abs_diff   = cv2.bitwise_and(abs_diff, valid_mask)
+
+        _, diff_bin = cv2.threshold(
+            abs_diff, int(DIFF_THRESHOLD * 255), 255, cv2.THRESH_BINARY
+        )
+
+        k_open  = np.ones((11, 11), np.uint8)
+        k_close = np.ones((15, 15), np.uint8)
+        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_OPEN,  k_open,  iterations=1)
+        diff_bin = cv2.morphologyEx(diff_bin, cv2.MORPH_CLOSE, k_close, iterations=2)
+
+        def _mask_to_boxes(mask: np.ndarray) -> list:
+            conts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            boxes = []
+            for cnt in conts:
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                area = bw * bh
+                if area < area_min:
+                    continue
+                ratio = max(bw / (bh + 1e-6), bh / (bw + 1e-6))
+                if ratio > 8:
+                    continue
+                if area > int(0.35 * w * h):
+                    continue
+                boxes.append([bx, by, bx + bw, by + bh])
+            return boxes
+
+        return _mask_to_boxes(diff_bin), []
+
+    def _make_white_bg(self, gray: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        canvas = np.full_like(gray, 255)
+        canvas[mask > 0] = gray[mask > 0]
+        return canvas
+
+    def _draw_film_warning(self, vis: np.ndarray, film_mask: np.ndarray, ratio: float) -> np.ndarray:
+        out     = vis.copy()
+        overlay = np.zeros_like(out)
+        overlay[film_mask > 0] = (0, 165, 255)
+        out = cv2.addWeighted(out, 0.65, overlay, 0.35, 0)
+        cv2.putText(
+            out,
+            f"RETAKE: 塑料膜覆盖 {ratio*100:.1f}%（超过阈值 {FILM_COVERAGE_THRESHOLD*100:.0f}%）",
+            (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 0, 255), 2,
+        )
+        return out
+
+    def _put_status(self, vis: np.ndarray, status: str, msg: str) -> np.ndarray:
+        out   = vis.copy()
+        color = (0, 0, 255) if status != "PASS" else (0, 180, 0)
+        cv2.putText(out, f"{status}: {msg}", (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+        return out
+
+    def _clamp(self, x1, y1, x2, y2, w, h) -> list:
+        x1 = max(0, min(int(x1), w - 1))
+        y1 = max(0, min(int(y1), h - 1))
+        x2 = max(x1 + 1, min(int(x2), w))
+        y2 = max(y1 + 1, min(int(y2), h))
+        return [x1, y1, x2, y2]
+
+    def _simple_similarity(self, ref: np.ndarray, test: np.ndarray) -> float:
+        if ref.shape != test.shape:
+            test = cv2.resize(test, (ref.shape[1], ref.shape[0]))
+        return max(0.0, 1.0 - float(np.mean(cv2.absdiff(ref, test))) / 255.0)
