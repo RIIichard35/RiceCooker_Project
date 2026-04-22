@@ -26,12 +26,26 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-# ── 可选：onnxruntime（推荐），fallback 到 cv2.dnn ──────────────────────
+# ── 推理后端自动探测（优先级：Hailo > onnxruntime > cv2.dnn） ──────────
+# Hailo：树莓派 AI HAT+（Hailo-8L，13 TOPS）
+try:
+    from hailo_platform import (
+        HEF, VDevice, HailoStreamInterface,
+        InferVStreams, ConfigureParams,
+        InputVStreamParams, OutputVStreamParams,
+        FormatType,
+    )
+    _HAILO_AVAILABLE = True
+except ImportError:
+    _HAILO_AVAILABLE = False
+
+# onnxruntime：PC / Pi（无 Hailo 时回退）
 try:
     import onnxruntime as ort
     _ORT_AVAILABLE = True
@@ -80,14 +94,20 @@ def _nms(boxes: list[dict], iou_thr: float = 0.45) -> list[dict]:
 
 class Stage2Detector:
     """
-    YOLOv8 ONNX 划痕/裂纹检测器。
+    YOLOv8 划痕/裂纹检测器。
+
+    推理后端自动选择（优先级从高到低）：
+      1. Hailo-8L（AI HAT+，需要 .hef 文件 + hailo_platform 库）
+      2. onnxruntime CPU（PC / Pi 通用）
+      3. cv2.dnn（最低兼容回退）
 
     参数
     ----
-    model_path     : str   — ONNX 模型路径（相对或绝对）
-    conf_threshold : float — 置信度阈值，低于此值的框丢弃（默认 0.25）
+    model_path     : str   — ONNX 模型路径；若同目录下存在同名 .hef 则优先用 Hailo
+    hef_path       : str | None — 显式指定 .hef 路径（None 则自动推断）
+    conf_threshold : float — 置信度阈值（默认 0.25）
     iou_threshold  : float — NMS IoU 阈值（默认 0.45）
-    roi_padding    : float — 在 Stage1 bbox 基础上额外扩展的比例（默认 0.05）
+    roi_padding    : float — 产品框扩展比例（默认 0.05）
     """
 
     MODEL_INPUT_W = 640
@@ -96,6 +116,7 @@ class Stage2Detector:
     def __init__(
         self,
         model_path: str,
+        hef_path:       str | None = None,
         conf_threshold: float = 0.25,
         iou_threshold:  float = 0.45,
         roi_padding:    float = 0.05,
@@ -104,21 +125,36 @@ class Stage2Detector:
         self.iou_threshold  = iou_threshold
         self.roi_padding    = roi_padding
         self.class_names:   dict[int, str] = {0: "scratch", 1: "crack"}
+        self._backend = "none"
 
         model_path = os.path.normpath(model_path)
+
+        # ── 自动推断 .hef 路径（同目录，同名，不同扩展名）
+        if hef_path is None:
+            hef_path = str(Path(model_path).with_suffix(".hef"))
+
+        # ── 后端 1：Hailo ────────────────────────────────────────────────
+        if _HAILO_AVAILABLE and os.path.exists(hef_path):
+            try:
+                self._load_hailo(hef_path)
+                print(f"[Stage2] Hailo-8L 推理就绪  ← {Path(hef_path).name}")
+                self._backend = "hailo"
+                return
+            except Exception as e:
+                print(f"[Stage2] Hailo 加载失败，退回 onnxruntime: {e}")
+
+        # ── 后端 2 / 3：ONNX ─────────────────────────────────────────────
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"[Stage2] 找不到模型文件: {model_path}")
 
-        # 加载 ONNX
         if _ORT_AVAILABLE:
             self._sess = ort.InferenceSession(
                 model_path,
                 providers=["CPUExecutionProvider"],
             )
             self._input_name = self._sess.get_inputs()[0].name
-            # 从元数据读取类别名（如果有）
             meta = self._sess.get_modelmeta()
-            raw = meta.custom_metadata_map.get("names")
+            raw  = meta.custom_metadata_map.get("names")
             if raw:
                 try:
                     self.class_names = {
@@ -128,10 +164,36 @@ class Stage2Detector:
                     }
                 except Exception:
                     pass
-            print(f"[Stage2] 模型加载成功（onnxruntime），类别: {self.class_names}")
+            print(f"[Stage2] onnxruntime CPU 推理就绪，类别: {self.class_names}")
+            self._backend = "ort"
         else:
             self._net = cv2.dnn.readNetFromONNX(model_path)
-            print(f"[Stage2] 模型加载成功（cv2.dnn），类别: {self.class_names}")
+            print(f"[Stage2] cv2.dnn 推理就绪（兼容模式），类别: {self.class_names}")
+            self._backend = "cv2dnn"
+
+    # ── Hailo 初始化 ──────────────────────────────────────────────────────
+
+    def _load_hailo(self, hef_path: str) -> None:
+        """加载 .hef 并建立 Hailo 推理管道（在 Pi 上调用）。"""
+        self._hef      = HEF(hef_path)
+        self._vdevice  = VDevice()          # 连接 Hailo-8L 硬件
+        cfg_params     = ConfigureParams.create_from_hef(
+            self._hef, interface=HailoStreamInterface.PCIe
+        )
+        net_groups     = self._vdevice.configure(self._hef, cfg_params)
+        self._net_group        = net_groups[0]
+        self._net_group_params = self._net_group.create_params()
+
+        self._in_params  = InputVStreamParams.make(
+            self._net_group, format_type=FormatType.FLOAT32
+        )
+        self._out_params = OutputVStreamParams.make(
+            self._net_group, format_type=FormatType.FLOAT32
+        )
+        # 读取输入层名称
+        self._hailo_input_name = list(
+            self._hef.get_input_vstream_infos()
+        )[0].name
 
     # ── 公开接口 ──────────────────────────────────────────────────────────
 
@@ -278,13 +340,43 @@ class Stage2Detector:
         return img.transpose(2, 0, 1)[np.newaxis]  # (1, 3, H, W)
 
     def _infer(self, blob: np.ndarray) -> np.ndarray:
-        """执行 ONNX 推理，返回 (6, 8400) 数组。"""
-        if _ORT_AVAILABLE:
+        """
+        执行推理，返回 (6, 8400) 数组。
+        根据 self._backend 自动选择 Hailo / onnxruntime / cv2.dnn。
+        """
+        if self._backend == "hailo":
+            return self._infer_hailo(blob)
+        if self._backend == "ort":
             out = self._sess.run(None, {self._input_name: blob})[0]  # (1,6,8400)
-        else:
-            self._net.setInput(blob)
-            out = self._net.forward()
-        return out[0]  # (6, 8400)
+            return out[0]
+        # cv2.dnn
+        self._net.setInput(blob)
+        return self._net.forward()[0]   # (6, 8400)
+
+    def _infer_hailo(self, blob: np.ndarray) -> np.ndarray:
+        """
+        通过 hailo_platform 在 Hailo-8L 上推理。
+        blob: (1, 3, 640, 640) float32  →  返回 (6, 8400) float32
+        """
+        # Hailo 输入格式：NHWC float32
+        nhwc = blob[0].transpose(1, 2, 0)[np.newaxis]  # (1, 640, 640, 3)
+        input_data = {self._hailo_input_name: nhwc}
+
+        with InferVStreams(
+            self._net_group,
+            self._in_params,
+            self._out_params,
+        ) as pipeline:
+            with self._net_group.activate(self._net_group_params):
+                raw_out = pipeline.infer(input_data)
+
+        # 取第一个输出张量，整理成 (6, 8400)
+        out_key = list(raw_out.keys())[0]
+        out     = raw_out[out_key]          # 通常 (1, 8400, 6) 或 (1, 6, 8400)
+        out     = np.squeeze(out)           # (8400, 6) 或 (6, 8400)
+        if out.shape[0] == 8400:            # (8400, 6) → transpose → (6, 8400)
+            out = out.T
+        return out.astype(np.float32)
 
     def _parse_output(
         self,
