@@ -1,0 +1,52 @@
+import cv2
+import numpy as np
+from rembg import remove, new_session
+from PIL import Image
+import io
+
+def extract_product_to_black_mask(image_path, output_path):
+    print("🚀 正在加载高精度分割模型...")
+    # 使用 isnet-general-use 模型，它对工业产品和硬边缘物体的分割效果极佳
+    session = new_session("isnet-general-use")
+    
+    print("📸 正在读取图像并进行一键全自动抠图...")
+    # 读取原始图片数据
+    with open(image_path, 'rb') as i:
+        input_data = i.read()
+        
+    # 执行抠图，开启 alpha_matting 让反光边缘过渡更自然，不突兀
+    output_data = remove(
+        input_data, 
+        session=session, 
+        alpha_matting=True, 
+        alpha_matting_foreground_threshold=240,
+        alpha_matting_background_threshold=10
+    )
+    
+    # 将输出的二进制数据转为 PIL Image，再转为 OpenCV 格式 (RGBA)
+    img_rgba = Image.open(io.BytesIO(output_data)).convert("RGBA")
+    img_cv_rgba = cv2.cvtColor(np.array(img_rgba), cv2.COLOR_RGBA2BGRA)
+    
+    print("🎨 正在生成纯黑背景的测试图像...")
+    # 分离 RGB 通道和 Alpha (透明度) 通道
+    b, g, r, a = cv2.split(img_cv_rgba)
+    img_rgb = cv2.merge((b, g, r))
+    
+    # 创建一个与原图大小相同的纯黑蒙版 (可以根据需要改成纯白)
+    black_background = np.zeros_like(img_rgb)
+    
+    # 将 Alpha 通道归一化为 0.0 - 1.0 的浮点数掩码
+    alpha_mask = a.astype(float) / 255.0
+    
+    # Alpha 融合：保留前景，背景替换为纯黑
+    for c in range(0, 3):
+        black_background[:, :, c] = (alpha_mask * img_rgb[:, :, c] +
+                                     (1 - alpha_mask) * black_background[:, :, c])
+        
+    # 保存最终结果
+    cv2.imwrite(output_path, black_background)
+    print(f"✅ 处理完成！请查看生成的文件: {output_path}")
+
+if __name__ == "__main__":
+    # 请确保图片名称与你实际的文件名一致
+    extract_product_to_black_mask("125225back.jpg", "result_cooker_mask.jpg")

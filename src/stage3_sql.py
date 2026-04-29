@@ -13,7 +13,7 @@ class Stage3SQLRecorder:
     作用：
     1) 为每个产品生成可追溯 product_id
     2) 记录每次检测的主结果（products）
-    3) 记录三连拍帧级结果（frames）
+    3) 记录帧级结果（frames，当前流程固定单帧）
     4) 记录 Stage2 缺陷明细（defects）
     """
 
@@ -125,7 +125,7 @@ class Stage3SQLRecorder:
         stage2_result: dict | None,
         final_status: str,
         fail_reason: str | None,
-        sharpest_idx: int | None,
+        inspected_idx: int | None,
         timing: dict | None,
     ) -> None:
         now = datetime.now().isoformat(timespec="seconds")
@@ -144,7 +144,7 @@ class Stage3SQLRecorder:
                     now,
                     final_status,
                     fail_reason,
-                    sharpest_idx,
+                    inspected_idx,
                     timing.get("stage1_total"),
                     timing.get("stage2"),
                     timing.get("total"),
@@ -182,7 +182,7 @@ class Stage3SQLRecorder:
                         """,
                         (
                             product_id,
-                            sharpest_idx,
+                            inspected_idx,
                             defect.get("class_name", "unknown"),
                             defect.get("score"),
                             x1,

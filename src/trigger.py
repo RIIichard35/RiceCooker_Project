@@ -190,12 +190,9 @@ class PiCamera(BaseCamera):
     - 关闭自动曝光（AeEnable=False），锁定曝光时间
     - 预览流用低分辨率（320×240），触发后切高分辨率
 
-    连拍说明
+    抓拍说明
     --------
-    - trigger.capture_burst() 会在触发后连续调用 capture_hires() 3 次，间隔 5 ms
-    - picamera2 单次 capture_array("main") 耗时约 10~30 ms，5 ms 间隔下
-      相邻两张实际时差约 15~35 ms，足够捕捉运动中的三个不同位置
-    - 若需更短间隔，可改用 picamera2 的 capture_sequence() 连拍模式（见注释）
+    - 当前流程为单张抓拍，触发后调用一次 capture_hires()
     """
 
     def __init__(
@@ -254,7 +251,7 @@ class PiCamera(BaseCamera):
 
 class ProductTrigger:
     """
-    产品完整度检测 + 触发逻辑 + 连拍。
+    产品完整度检测 + 触发逻辑 + 单张抓拍。
 
     触发流程
     --------
@@ -262,8 +259,7 @@ class ProductTrigger:
     2. 连续 stable_frames 帧满足：
            fill_ratio > fill_threshold  AND  波动幅度 < stable_tol
        → 触发
-    3. 触发后立即连拍 burst_count 张，每张间隔 burst_interval_ms 毫秒
-    4. 从连拍结果中选出清晰度最高（Laplacian 方差最大）的一张送检测
+    3. 触发后立即抓拍单张高清图送检测
 
     参数
     ----
@@ -273,8 +269,6 @@ class ProductTrigger:
     stable_frames     : int        — 判断稳定所需连续帧数（默认 4）
     dark_thresh       : int        — 产品前景灰度上限（默认 110，深色电饭煲）
     stable_tol        : float      — 帧间允许波动幅度（默认 0.06）
-    burst_count       : int        — 触发后连拍张数（默认 3）
-    burst_interval_ms : float      — 连拍间隔毫秒数（默认 5 ms）
     """
 
     def __init__(
@@ -285,8 +279,6 @@ class ProductTrigger:
         stable_frames:     int   = 4,
         dark_thresh:       int   = 110,
         stable_tol:        float = 0.06,
-        burst_count:       int   = 3,
-        burst_interval_ms: float = 5.0,
     ) -> None:
         self.camera            = camera
         self.roi_rel           = roi_rel
@@ -294,8 +286,6 @@ class ProductTrigger:
         self.stable_frames     = stable_frames
         self.dark_thresh       = dark_thresh
         self.stable_tol        = stable_tol
-        self.burst_count       = burst_count
-        self.burst_interval_ms = burst_interval_ms
         self._history: list[float] = []
 
     # ── 占比检测 ──────────────────────────────────────────────────────────
@@ -332,55 +322,14 @@ class ProductTrigger:
         """返回当前历史窗口的占比列表（用于可视化）。"""
         return list(self._history)
 
-    # ── 连拍 ──────────────────────────────────────────────────────────────
+    # ── 单张抓拍 ───────────────────────────────────────────────────────────
 
-    def capture_burst(self) -> list[np.ndarray]:
-        """
-        触发后立即连拍 burst_count 张高清图，
-        每张之间休眠 burst_interval_ms 毫秒。
-
-        返回：图像列表（BGR ndarray），长度 <= burst_count。
-        """
-        shots: list[np.ndarray] = []
-        for i in range(self.burst_count):
-            if i > 0:
-                time.sleep(self.burst_interval_ms / 1000.0)
-            img = self.camera.capture_hires()
-            if img is not None:
-                shots.append(img)
-                print(
-                    f"[Burst] 第 {i+1}/{self.burst_count} 张  "
-                    f"(+{i * self.burst_interval_ms:.0f} ms)"
-                )
-        return shots
-
-    @staticmethod
-    def select_sharpest(
-        frames: list[np.ndarray],
-    ) -> tuple[int, np.ndarray] | None:
-        """
-        从连拍结果中选出清晰度最高（Laplacian 方差最大）的一张。
-
-        返回 (index, frame)，列表为空时返回 None。
-        """
-        if not frames:
-            return None
-        scores: list[float] = []
-        for f in frames:
-            gray  = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if f.ndim == 3 else f
-            score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            scores.append(score)
-        best_idx = int(np.argmax(scores))
-        return best_idx, frames[best_idx]
-
-    @staticmethod
-    def sharpness_scores(frames: list[np.ndarray]) -> list[float]:
-        """返回每张图的 Laplacian 清晰度分数（用于可视化对比）。"""
-        result: list[float] = []
-        for f in frames:
-            gray  = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if f.ndim == 3 else f
-            result.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
-        return result
+    def capture_single(self) -> np.ndarray | None:
+        """触发后抓拍单张高清图。"""
+        img = self.camera.capture_hires()
+        if img is not None:
+            print("[Capture] 已抓拍 1 张高清图")
+        return img
 
     # ── 内部工具 ──────────────────────────────────────────────────────────
 
@@ -398,25 +347,22 @@ class ProductTrigger:
 
     def run_until_trigger(
         self, timeout: float = 30.0
-    ) -> list[np.ndarray]:
+    ) -> np.ndarray | None:
         """
         阻塞运行，直到触发或超时。
-        触发后自动连拍 burst_count 张，返回图像列表。
-        超时返回空列表。
+        触发后自动抓拍单张高清图并返回。
+        超时返回 None。
 
         典型用法（树莓派主循环）
         -----------------------
         cam     = PiCamera()
         cam.start()
-        trigger = ProductTrigger(cam, roi_rel=...,
-                                 fill_threshold=0.95,
-                                 burst_count=3, burst_interval_ms=5)
+        trigger = ProductTrigger(cam, roi_rel=..., fill_threshold=0.95)
         while True:
-            shots = trigger.run_until_trigger(timeout=60)
-            if not shots:
+            shot = trigger.run_until_trigger(timeout=60)
+            if shot is None:
                 continue
-            best_idx, best = ProductTrigger.select_sharpest(shots)
-            result = detector.inspect_with_localization(best, ...)
+            result = detector.inspect_with_localization(shot, ...)
             # → 上报结果 / 控制流水线
         """
         t0 = time.time()
@@ -427,8 +373,8 @@ class ProductTrigger:
                 continue
             fill = self.compute_fill_ratio(frame)
             if self.check_trigger(fill):
-                shots = self.capture_burst()
+                shot = self.capture_single()
                 self.reset()
-                return shots
+                return shot
         print("[ProductTrigger] 超时未检测到完整产品")
-        return []
+        return None

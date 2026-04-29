@@ -1,8 +1,0 @@
-names:
-- scratch
-- dent
-- plastic_film
-nc: 3
-path: "D:\\\u6570\u636E\u96C6\\RiceCooker_Project\\training_workspace"
-train: images/train
-val: images/val

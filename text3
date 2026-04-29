@@ -1,0 +1,77 @@
+import cv2
+import numpy as np
+from rembg import remove, new_session
+from PIL import Image
+import io
+import random
+from pathlib import Path
+
+def extract_product_to_black_mask(image_path, output_path, session):
+    print(f"Processing: {image_path.name}")
+    with open(image_path, "rb") as i:
+        input_data = i.read()
+
+    output_data = remove(
+        input_data,
+        session=session,
+        alpha_matting=True,
+        alpha_matting_foreground_threshold=240,
+        alpha_matting_background_threshold=10,
+    )
+
+    img_rgba = Image.open(io.BytesIO(output_data)).convert("RGBA")
+    img_cv_rgba = cv2.cvtColor(np.array(img_rgba), cv2.COLOR_RGBA2BGRA)
+
+    b, g, r, a = cv2.split(img_cv_rgba)
+    img_rgb = cv2.merge((b, g, r))
+
+    black_background = np.zeros_like(img_rgb)
+    alpha_mask = a.astype(float) / 255.0
+
+    for c in range(0, 3):
+        black_background[:, :, c] = (
+            alpha_mask * img_rgb[:, :, c]
+            + (1 - alpha_mask) * black_background[:, :, c]
+        )
+
+    cv2.imwrite(str(output_path), black_background)
+    print(f"Saved: {output_path}")
+
+
+def sample_and_process_images(
+    standards_dir="assets/standards",
+    output_dir="text3.1",
+    sample_size=10,
+):
+    standards_path = Path(standards_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    candidates = [p for p in standards_path.rglob("*") if p.suffix.lower() in exts]
+
+    if len(candidates) < sample_size:
+        raise ValueError(
+            f"Not enough images in {standards_path}. Found {len(candidates)}, need {sample_size}."
+        )
+
+    sampled = random.sample(candidates, sample_size)
+    print("Selected images:")
+    for p in sampled:
+        print(f"- {p}")
+
+    print("Loading segmentation model...")
+    session = new_session("isnet-general-use")
+
+    for image_path in sampled:
+        out_name = f"{image_path.stem}_mask.png"
+        extract_product_to_black_mask(image_path, output_path / out_name, session)
+
+    print(f"Done. Generated {sample_size} images in: {output_path.resolve()}")
+
+if __name__ == "__main__":
+    sample_and_process_images(
+        standards_dir="assets/standards",
+        output_dir="text3.1",
+        sample_size=10,
+    )

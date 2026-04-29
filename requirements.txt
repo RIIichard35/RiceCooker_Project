@@ -1,6 +1,0 @@
-opencv-python
-ultralytics
-numpy
-scikit-image
-streamlit
-watchdog

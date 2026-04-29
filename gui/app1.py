@@ -1,6 +1,6 @@
 """
 电饭煲外观初筛系统 — Stage 1 前端（Streamlit）
-兼容 Windows 开发环境 & 树莓派 5 生产环境
+整图检测版：无需 ROI 标定，含白色标签保留与姿态偏斜告警
 
 运行方式：
     streamlit run gui/app1.py
@@ -8,32 +8,35 @@
 
 from __future__ import annotations
 
-import json
-import os
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
 import streamlit as st
 
-# ── 路径设置（相对路径，兼容树莓派） ────────────────────────────────────
+# ── 路径设置 ─────────────────────────────────────────────────────────────
 GUI_DIR      = Path(__file__).resolve().parent
 PROJECT_ROOT = GUI_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import (
-    CALIB_DIR,
+    ANOMALIB_MODEL_DIR,
+    ANOMALIB_SCORE_THRESHOLD,
+    ANOMALIB_HOLE_FAIL_THRESH,
+    ANOMALIB_TEMPLATE_FAIL_THRESH,
+    ANOMALIB_TEMPLATE_GATE_ENABLED,
     FILM_COVERAGE_THRESHOLD,
+    get_anomalib_threshold,
     MAX_MISSING_COUNT,
     MIN_MATCH_COUNT,
     STANDARDS_DIR,
 )
 from src.stage1_vision import Stage1Detector
+from src.stage2_anomalib import AnomalibDetector
 
-# ── 页面基础配置 ────────────────────────────────────────────────────────
+# ── 页面配置 ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="电饭煲初筛检测台",
     page_icon="🔍",
@@ -43,139 +46,126 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.card {
-    padding: 18px 22px; border-radius: 10px;
-    text-align: center; margin-bottom: 14px;
-    font-family: "Microsoft YaHei", sans-serif;
+/* ── 整体字体 ── */
+html, body, [class*="css"] { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }
+
+/* ── 结论卡片 ── */
+.verdict-card {
+    padding: 20px 28px; border-radius: 12px;
+    text-align: center; margin-bottom: 16px;
 }
-.card-pass   { background:#d4edda; color:#155724; border:1px solid #c3e6cb; }
-.card-fail   { background:#f8d7da; color:#721c24; border:1px solid #f5c6cb; }
-.card-retake { background:#fff3cd; color:#856404; border:1px solid #ffeeba; }
+.verdict-pass   { background: #d4edda; color: #155724; border: 2px solid #28a745; }
+.verdict-fail   { background: #f8d7da; color: #721c24; border: 2px solid #dc3545; }
+.verdict-retake { background: #fff3cd; color: #856404; border: 2px solid #ffc107; }
 
-.metric-row  { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0; }
-.metric-box  {
-    flex:1; min-width:110px; background:#f0f2f6;
-    border-radius:8px; padding:10px 8px; text-align:center;
+/* ── 指标行 ── */
+.metric-row { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px; }
+.metric-box {
+    flex: 1; min-width: 100px; background: #f0f2f6;
+    border-radius: 8px; padding: 10px 6px; text-align: center;
 }
-.metric-label { font-size:0.72rem; color:#555; margin-bottom:4px; }
-.metric-value { font-size:1.20rem; font-weight:700; color:#222; }
+.metric-label { font-size: 0.70rem; color: #666; margin-bottom: 4px; }
+.metric-value { font-size: 1.15rem; font-weight: 700; color: #222; }
 
-.issue-item { color:#721c24; margin:3px 0; }
-.warn-item  { color:#856404; margin:3px 0; }
+/* ── 流程步骤标题 ── */
+.step-header {
+    font-size: 0.85rem; font-weight: 700; color: #0078d4;
+    border-left: 3px solid #0078d4; padding-left: 8px;
+    margin: 14px 0 6px;
+}
 
-.calib-badge-on  { background:#d4edda; color:#155724; padding:4px 10px;
-                   border-radius:6px; font-size:0.82rem; }
-.calib-badge-off { background:#f8d7da; color:#721c24; padding:4px 10px;
-                   border-radius:6px; font-size:0.82rem; }
+/* ── 问题 / 警告列表 ── */
+.issue-item { color: #721c24; margin: 3px 0; font-size: 0.88rem; }
+.warn-item  { color: #856404; margin: 3px 0; font-size: 0.88rem; }
+
+/* ── 图片说明标签 ── */
+.img-caption {
+    text-align: center; font-size: 0.78rem; color: #555;
+    margin-top: 4px; padding: 3px 6px;
+    background: #f8f9fa; border-radius: 4px;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── 工具函数 ────────────────────────────────────────────────────────────
+# ── 工具函数 ─────────────────────────────────────────────────────────────
 
 def bgr_to_rgb(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def bgra_to_rgba(img: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+
+
+def cutout_to_display(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    if img.ndim == 3 and img.shape[2] == 4:
+        return bgra_to_rgba(img)
+    return bgr_to_rgb(img)
+
+
+def load_st_cutout(path: str) -> np.ndarray | None:
+    """从 st/ 目录加载预处理透明抠图（BGRA → RGBA）。"""
+    try:
+        arr = np.fromfile(path, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        if img.ndim == 3 and img.shape[2] == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    except Exception:
+        return None
 
 
 def bytes_to_bgr(data: bytes) -> np.ndarray | None:
     arr = np.frombuffer(data, dtype=np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-
-def status_card(status: str, issues: list[str], warnings: list[str]) -> str:
-    css   = {"PASS": "card-pass", "FAIL": "card-fail", "RETAKE": "card-retake"}
+def verdict_html(status: str, issues: list[str], warnings: list[str]) -> str:
+    css   = {"PASS": "verdict-pass", "FAIL": "verdict-fail", "RETAKE": "verdict-retake"}
     icon  = {"PASS": "✅", "FAIL": "❌", "RETAKE": "⚠️"}
-    label = {"PASS": "通过初筛", "FAIL": "初筛不合格", "RETAKE": "需要重拍"}
-    c = css.get(status, "card-fail")
+    label = {"PASS": "初筛通过", "FAIL": "初筛不合格", "RETAKE": "需要重拍"}
+    c = css.get(status, "verdict-fail")
     i = icon.get(status, "❓")
     l = label.get(status, status)
     issues_html = "".join(
-        f'<p class="issue-item">⛔ {iss}</p>' for iss in issues
-    ) if issues else '<p style="color:#155724">无阻断性问题</p>'
+        f'<p class="issue-item">⛔ {s}</p>' for s in issues
+    ) if issues else '<p style="color:#155724;font-size:0.88rem">无阻断性问题</p>'
     warns_html = "".join(
         f'<p class="warn-item">⚠ {w}</p>' for w in warnings
     ) if warnings else ""
-    return f"""
-<div class="card {c}">
-  <h2 style="margin:0 0 8px">{i} {l}</h2>
-  {issues_html}
-  {warns_html}
-</div>"""
+    return (
+        f'<div class="verdict-card {c}">'
+        f'<h2 style="margin:0 0 10px;font-size:1.5rem">{i} {l}</h2>'
+        f'{issues_html}{warns_html}</div>'
+    )
 
-
-def metric_row_html(metrics: list[tuple[str, str]]) -> str:
+def metric_row(metrics: list[tuple[str, str]]) -> str:
     boxes = "".join(
         f'<div class="metric-box">'
-        f'<div class="metric-label">{label}</div>'
-        f'<div class="metric-value">{value}</div>'
+        f'<div class="metric-label">{lb}</div>'
+        f'<div class="metric-value">{val}</div>'
         f'</div>'
-        for label, value in metrics
+        for lb, val in metrics
     )
     return f'<div class="metric-row">{boxes}</div>'
 
+def step_header(text: str) -> None:
+    st.markdown(f'<div class="step-header">{text}</div>', unsafe_allow_html=True)
 
-# ── 标定读写函数 ────────────────────────────────────────────────────────
-
-_CALIB_DIR = Path(CALIB_DIR)
-
-
-def load_calibration(view: str) -> list | None:
-    """读取视角标定 ROI（相对坐标 [x1r, y1r, x2r, y2r]），无则返回 None。"""
-    p = _CALIB_DIR / f"{view}.json"
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8")).get("roi_rel")
-    except Exception:
-        return None
+def make_label_overlay(bgr: np.ndarray, label_mask: np.ndarray) -> np.ndarray:
+    """将标签区域以青黄色半透明叠加到原图。"""
+    overlay = np.zeros_like(bgr)
+    overlay[label_mask > 0] = (0, 220, 200)
+    return cv2.addWeighted(bgr, 0.70, overlay, 0.30, 0)
 
 
-def save_calibration(view: str, roi_rel: list, ref_wh: tuple) -> None:
-    _CALIB_DIR.mkdir(parents=True, exist_ok=True)
-    data = {
-        "view":       view,
-        "roi_rel":    roi_rel,
-        "ref_size":   list(ref_wh),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    (_CALIB_DIR / f"{view}.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-def calib_to_abs(roi_rel: list, w: int, h: int) -> list:
-    return [
-        int(roi_rel[0] * w), int(roi_rel[1] * h),
-        int(roi_rel[2] * w), int(roi_rel[3] * h),
-    ]
-
-
-def draw_roi_preview(img_bgr: np.ndarray, roi_rel: list) -> np.ndarray:
-    """在图像上绘制半透明 ROI 框用于预览。"""
-    h, w = img_bgr.shape[:2]
-    x1, y1, x2, y2 = calib_to_abs(roi_rel, w, h)
-    vis     = img_bgr.copy()
-    overlay = vis.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 200, 0), -1)
-    cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, vis)
-    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 3)
-    cv2.putText(
-        vis, f"ROI  {x2-x1}x{y2-y1}px",
-        (x1, max(22, y1 - 8)),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 200, 0), 2,
-    )
-    return vis
-
-
-# ── 视角名称映射 ────────────────────────────────────────────────────────
-
-VIEW_LABELS: dict[str, str] = {
-    "front": "正面",
-    "back":  "后面",
-    "left":  "左面",
-    "right": "右面",
-    "top":   "顶部",
-}
+# ── 视角映射 ─────────────────────────────────────────────────────────────
+VIEW_LABELS = {"front": "正面", "back": "后面", "left": "左面",
+               "right": "右面", "top": "顶部"}
 
 std_root = Path(STANDARDS_DIR)
 if std_root.exists():
@@ -190,592 +180,453 @@ view_display = [VIEW_LABELS.get(v, v) for v in available_views]
 view_map     = dict(zip(view_display, available_views))
 
 
-# ── 侧边栏 ──────────────────────────────────────────────────────────────
+# ── 侧边栏 ───────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ 检测配置")
 
 if not available_views:
-    st.sidebar.error(f"找不到标准图库目录：\n{std_root}")
+    st.sidebar.error(f"找不到标准图库：\n{std_root}")
 
 selected_label: str | None = st.sidebar.selectbox(
-    "检测视角（按面选择）",
+    "检测视角",
     options=view_display,
     index=0 if view_display else None,
-    help="请选择当前拍摄的产品面",
 )
 selected_view = view_map.get(selected_label, selected_label) if selected_label else None
 
-# 标定状态徽章
-if selected_view:
-    roi_rel = load_calibration(selected_view)
-    if roi_rel:
-        st.sidebar.markdown(
-            f'<span class="calib-badge-on">📐 ROI 已标定</span>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.sidebar.markdown(
-            '<span class="calib-badge-off">📐 ROI 未标定（使用自动定位）</span>',
-            unsafe_allow_html=True,
-        )
-else:
-    roi_rel = None
-
 st.sidebar.markdown("---")
-st.sidebar.subheader("阈值调节")
+st.sidebar.subheader("检测阈值")
 
 film_thresh = st.sidebar.slider(
-    "塑料膜覆盖阈值 (%)", 10, 90,
-    int(FILM_COVERAGE_THRESHOLD * 100), 5,
-    help="产品被塑料膜遮盖超过此比例时判为 RETAKE",
+    "塑料膜阈值 (%)", 10, 90, int(FILM_COVERAGE_THRESHOLD * 100), 5,
 )
 match_thresh = st.sidebar.slider(
-    "ORB 匹配点阈值", 5, 60, MIN_MATCH_COUNT,
-    help="与标准图 ORB 特征匹配点数下限",
+    "ORB 匹配点", 5, 60, MIN_MATCH_COUNT,
 )
 missing_thresh = st.sidebar.slider(
-    "缺件框数量阈值", 1, 10, MAX_MISSING_COUNT,
-    help="缺件框数量超过此值则判为 FAIL",
+    "缺件框阈值", 1, 10, MAX_MISSING_COUNT,
 )
 
 st.sidebar.markdown("---")
-show_cutout = st.sidebar.checkbox("显示白底抠图", value=True)
-show_detail = st.sidebar.checkbox("显示调试详情", value=False)
+st.sidebar.subheader("Anomalib 特征比对")
+enable_anomalib = st.sidebar.checkbox(
+    "启用 Anomalib 缺件检测", value=True,
+)
+anomalib_threshold = st.sidebar.slider(
+    "异常分阈值", 0.10, 0.95,
+    float(get_anomalib_threshold(selected_view) if selected_view else ANOMALIB_SCORE_THRESHOLD),
+    0.05,
+    key=f"anom_thr_{selected_view or 'none'}",
+    help="默认随视角来自 config（ANOMALIB_THRESH_BY_VIEW）；可手动覆盖单会话",
+)
+
+st.sidebar.markdown("---")
+show_anomalib_heatmap = st.sidebar.checkbox("显示异常热图", value=True)
 
 
-# ── 加载检测器 ──────────────────────────────────────────────────────────
-
+# ── 加载检测器（缓存） ───────────────────────────────────────────────────
 @st.cache_resource(show_spinner="正在加载标准图库...")
 def load_detector(view_name: str) -> Stage1Detector:
     return Stage1Detector(str(std_root / view_name))
 
 
+@st.cache_resource(show_spinner="正在加载 Anomalib 模型...")
+def load_anomalib_detector(view_name: str) -> AnomalibDetector:
+    return AnomalibDetector(view=view_name, model_dir=ANOMALIB_MODEL_DIR)
+
+
+detector: Stage1Detector | None = None
+anomalib_det: AnomalibDetector | None = None
 if selected_view:
     detector = load_detector(selected_view)
     ref_count = len(detector.reference_data)
     st.sidebar.success(f"已加载 **{selected_label}** 标准图库（{ref_count} 张）")
-else:
-    detector = None
 
-
-# ── 主界面 ──────────────────────────────────────────────────────────────
-st.title("🏭 电饭煲外观初筛系统（Stage 1）")
-st.markdown("---")
-
-tab_detect, tab_calib, tab_monitor = st.tabs(["🔍  检测", "📐  ROI 标定", "📷  实时监控 Demo"])
-
-
-# ════════════════════════════════════════════════════════════════════════
-# Tab 1 — 检测
-# ════════════════════════════════════════════════════════════════════════
-with tab_detect:
-    col_upload, col_result = st.columns([1, 1.6], gap="large")
-
-    with col_upload:
-        st.subheader("① 上传待测图片")
-        uploaded = st.file_uploader(
-            "拖拽或点击上传（PNG / JPG / BMP）",
-            type=["png", "jpg", "jpeg", "bmp"],
-            label_visibility="collapsed",
-            key="detect_upload",
-        )
-
-        img_bgr: np.ndarray | None = None
-        if uploaded:
-            raw_bytes = uploaded.read()
-            img_bgr   = bytes_to_bgr(raw_bytes)
-            if img_bgr is not None:
-                h, w = img_bgr.shape[:2]
-                st.image(
-                    bgr_to_rgb(img_bgr),
-                    caption=f"待测原图  {w}×{h}px",
-                    use_container_width=True,
+    if enable_anomalib:
+        try:
+            anomalib_det = load_anomalib_detector(selected_view)
+            if anomalib_det.is_ready:
+                st.sidebar.success(
+                    f"Anomalib 模型已就绪（{anomalib_det._backend}）"
                 )
             else:
-                st.error("图片解码失败，请重新上传。")
-
-    with col_result:
-        st.subheader("② 检测结果")
-
-        if img_bgr is None:
-            st.info("👈 请先上传待测图片")
-        elif detector is None:
-            st.warning("请在左侧侧边栏选择检测视角后重试。")
-        else:
-            # 计算标定 bbox（绝对坐标）
-            h_img, w_img = img_bgr.shape[:2]
-            calib_bbox = calib_to_abs(roi_rel, w_img, h_img) if roi_rel else None
-
-            with st.spinner("正在检测中，请稍候..."):
-                result = detector.inspect_with_localization(
-                    img_bgr,
-                    min_match_count=match_thresh,
-                    missing_regions_fail_count=missing_thresh,
-                    calibrated_bbox=calib_bbox,
+                st.sidebar.warning(
+                    "Anomalib 模型未找到，请先运行：\n"
+                    "`python scripts/train_anomalib.py`"
                 )
+        except Exception as e:
+            st.sidebar.error(f"Anomalib 加载失败: {e}")
 
-            status   = result["status"]
-            issues   = result["issues"]
-            warnings = result["warnings"]
 
-            st.markdown(status_card(status, issues, warnings), unsafe_allow_html=True)
+# ── 主界面 ───────────────────────────────────────────────────────────────
+st.title("🔍 电饭煲外观初筛系统")
+st.caption("初筛结果展示")
+st.markdown("---")
 
-            film_pct  = result["film_coverage"] * 100
-            sim_pct   = result["similarity"] * 100
-            loc_score = result["localization_score"]
-            miss_cnt  = len(result["missing_regions"])
-            extra_cnt = len(result["extra_regions"])
+# ── 上传区 ───────────────────────────────────────────────────────────────
+col_up, col_hint = st.columns([1, 2], gap="large")
+with col_up:
+    uploaded = st.file_uploader(
+        "上传待测图片（PNG / JPG / BMP）",
+        type=["png", "jpg", "jpeg", "bmp"],
+        label_visibility="visible",
+    )
 
-            calib_flag = "已标定" if roi_rel else "自动"
+with col_hint:
+    if detector is None:
+        st.info("请先选择视角")
+    elif uploaded is None:
+        st.info("请上传图片")
+
+img_bgr: np.ndarray | None = None
+if uploaded:
+    img_bgr = bytes_to_bgr(uploaded.read())
+    if img_bgr is None:
+        st.error("图片解码失败，请重新上传。")
+
+# ── 手动触发检测（避免调整侧边栏时自动重跑抠图） ─────────────────────────
+run_detect = False
+if img_bgr is not None and detector is not None:
+    run_detect = st.button("▶ 开始检测", type="primary", use_container_width=False)
+    if not run_detect and "last_result" not in st.session_state:
+        st.info("点击开始检测")
+
+    # 有缓存结果时直接展示，避免重复推理
+    if not run_detect and "last_result" in st.session_state:
+        run_detect = False   # 展示由下方缓存逻辑接管
+
+# ── 检测主流程 ───────────────────────────────────────────────────────────
+if img_bgr is not None and detector is not None and (run_detect or "last_result" in st.session_state):
+    h_img, w_img = img_bgr.shape[:2]
+
+    if run_detect:
+        with st.spinner("Stage 1 检测中…"):
+            result = detector.inspect_with_localization(
+                img_bgr,
+                min_match_count=match_thresh,
+                missing_regions_fail_count=missing_thresh,
+            )
+        # Anomalib 推理（Stage1 质量门控通过后，Anomalib 是主判决者）
+        anomalib_result: dict | None = None
+        if (
+            enable_anomalib
+            and anomalib_det is not None
+            and anomalib_det.is_ready
+            and result.get("status") in ("PASS", "FAIL")
+        ):
+            cutout = result.get("cutout_rgba")
+            mask_crop = result.get("product_mask_crop")
+            # 只取产品 bbox 区域喂给 Anomalib，坐标对齐裁剪图
+            _pb = result.get("product_bbox")
+            if cutout is not None and _pb is not None:
+                _px1, _py1, _px2, _py2 = _pb
+                if _px2 > _px1 and _py2 > _py1:
+                    cutout = cutout[_py1:_py2, _px1:_px2]
+                    # product_mask_crop 已在 Stage1 按同一 bbox 裁好，勿二次切片
+            if cutout is not None and mask_crop is not None:
+                if mask_crop.shape[:2] != cutout.shape[:2]:
+                    mask_crop = cv2.resize(
+                        mask_crop,
+                        (cutout.shape[1], cutout.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+            if cutout is not None:
+                with st.spinner("Anomalib 特征比对中…"):
+                    _det_copy = AnomalibDetector.__new__(AnomalibDetector)
+                    _det_copy.__dict__.update(anomalib_det.__dict__)
+                    _det_copy.threshold = anomalib_threshold
+                    anomalib_result = _det_copy.inspect(cutout, stage1_fg_mask=mask_crop)
+                result["anomalib_result"] = anomalib_result
+                # 若 Anomalib 判 FAIL，更新顶层 status
+                if anomalib_result.get("status") == "FAIL":
+                    result["status"] = "FAIL"
+                    result["issues"] = result.get("issues", []) + anomalib_result.get("issues", [])
+        st.session_state["last_result"] = result
+        st.session_state["last_anomalib"] = result.get("anomalib_result")
+    else:
+        result = st.session_state["last_result"]
+        anomalib_result = st.session_state.get("last_anomalib")
+
+    status       = result["status"]
+    issues       = result["issues"]
+    warnings     = result["warnings"]
+    pose_angle   = result.get("pose_angle", 0.0)
+    pose_warning = result.get("pose_warning")
+    label_ratio  = result.get("label_area_ratio", 0.0) * 100
+    loc_method   = result.get("localization_method", "自动")
+    seg_backend  = result.get("segmentation_backend", "unknown")
+    seg_reason   = result.get("segmentation_fallback_reason")
+    film_pct     = result["film_coverage"] * 100
+    loc_score    = result["localization_score"]
+
+
+    ann_img         = result.get("annotated_image")
+    cut_rgba        = result.get("cutout_rgba")
+    ref_cutout_path = result.get("ref_cutout_path")
+    lmask           = result.get("label_mask")
+
+    # st/ 预处理透明抠图（最优先）
+    st_cutout_rgba: np.ndarray | None = None
+    if ref_cutout_path:
+        st_cutout_rgba = load_st_cutout(ref_cutout_path)
+
+    # ════════════════════════════════════════════════════════════════════
+    # 区域一：三图并列——原图 | 抠图 | 标注图
+    # ════════════════════════════════════════════════════════════════════
+    st.markdown("### 图像")
+    c_orig, c_cut, c_ann = st.columns(3, gap="medium")
+
+    with c_orig:
+        step_header("① 输入原图")
+        st.image(bgr_to_rgb(img_bgr),
+                 caption="原图",
+                 use_container_width=True)
+
+    with c_cut:
+        step_header("② 参考图")
+        if st_cutout_rgba is not None:
+            st.image(
+                st_cutout_rgba,
+                caption="参考抠图（标准库）",
+                use_container_width=True,
+            )
+        elif cut_rgba is not None:
+            st.image(
+                bgra_to_rgba(cut_rgba),
+                caption="产品抠图",
+                use_container_width=True,
+            )
+        else:
+            st.info("参考图缺失")
+
+    with c_ann:
+        step_header("③ 检测结果")
+        _clean = (anomalib_result or {}).get("clean_cutout")
+        if _clean is not None and _clean.any():
+            # 渲染灰色背景 BGR
+            if _clean.ndim == 3 and _clean.shape[2] == 4:
+                _a = _clean[:, :, 3:4].astype(np.float32) / 255.0
+                _bgr_base = _clean[:, :, :3].astype(np.float32)
+                _bg = np.full_like(_bgr_base, 128.0)
+                final_ann = (_a * _bgr_base + (1 - _a) * _bg).astype(np.uint8)
+            else:
+                final_ann = _clean[:, :, :3].copy()
+
+            _h, _w = final_ann.shape[:2]
+
+            if anomalib_result is not None:
+                a_boxes   = anomalib_result.get("anomaly_boxes", [])
+                h_boxes   = anomalib_result.get("hole_boxes", [])
+                a_status  = anomalib_result.get("status", "SKIP")
+                a_score   = anomalib_result.get("anomaly_score", 0.0)
+                h_score   = anomalib_result.get("hole_score", 0.0)
+
+                # 半透明红色蒙版覆盖异常框区域
+                overlay_layer = final_ann.copy()
+                all_defect_boxes = list(a_boxes)
+                for hb in h_boxes:
+                    if not any(
+                        max(hb[0], eb[0]) < min(hb[2], eb[2]) and
+                        max(hb[1], eb[1]) < min(hb[3], eb[3])
+                        for eb in all_defect_boxes
+                    ):
+                        all_defect_boxes.append(hb)
+
+                for box in all_defect_boxes:
+                    bx1, by1, bx2, by2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    cv2.rectangle(overlay_layer, (bx1, by1), (bx2, by2), (0, 0, 200), -1)
+                # 40% 透明度红色蒙版
+                final_ann = cv2.addWeighted(overlay_layer, 0.38, final_ann, 0.62, 0)
+
+                # 实线红框 + 标注文字
+                for idx, box in enumerate(all_defect_boxes):
+                    bx1, by1, bx2, by2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    is_hole = any(
+                        hb[0] == box[0] and hb[1] == box[1] for hb in h_boxes
+                    )
+                    label = "破损" if is_hole else f"异常{idx+1}"
+                    color = (0, 0, 230) if is_hole else (30, 30, 220)
+                    cv2.rectangle(final_ann, (bx1, by1), (bx2, by2), color, 2)
+                    # 标签背景
+                    txt_y = max(by1 - 4, 18)
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(final_ann, (bx1, txt_y - th - 4), (bx1 + tw + 4, txt_y + 2), color, -1)
+                    cv2.putText(final_ann, label, (bx1 + 2, txt_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                # 整体产品黄框
+                cv2.rectangle(final_ann, (2, 2), (_w - 3, _h - 3), (0, 215, 255), 3)
+
+                # 底部状态文字
+                s_color = (0, 180, 0) if a_status == "PASS" else (
+                    (0, 0, 220) if a_status == "FAIL" else (180, 140, 0)
+                )
+                status_txt = f"{a_status}  破损:{h_score*100:.1f}%  综合:{a_score:.3f}"
+                cv2.putText(final_ann, status_txt,
+                            (8, max(20, _h - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, s_color, 2)
+
+            caption_txt = "黄框=产品  红框=破损/异常区域" if anomalib_result else "检测图"
+            st.image(bgr_to_rgb(final_ann), caption=caption_txt, use_container_width=True)
+
+        elif ann_img is not None:
+            st.image(bgr_to_rgb(ann_img), caption="检测图", use_container_width=True)
+        else:
+            st.info("标注图未生成")
+
+    # ── Anomalib 热图 + 破洞专项展示 ────────────────────────────────────
+    anomalib_result = result.get("anomalib_result") or st.session_state.get("last_anomalib")
+    if show_anomalib_heatmap and anomalib_result is not None:
+        a_status  = anomalib_result.get("status", "SKIP")
+        h_score   = anomalib_result.get("hole_score", 0.0)
+        h_boxes   = anomalib_result.get("hole_boxes", [])
+        a_overlay = anomalib_result.get("heatmap_overlay")
+        pc_score  = anomalib_result.get("patchcore_score")
+        tpl_score = anomalib_result.get("template_score")
+        if pc_score is None:
+            pc_score = float(anomalib_result.get("anomaly_score", 0.0))
+        else:
+            pc_score = float(pc_score)
+        if tpl_score is None:
+            tpl_score = 0.0
+        else:
+            tpl_score = float(tpl_score)
+        tpl_thr = float(ANOMALIB_TEMPLATE_FAIL_THRESH)
+        combo_max = float(
+            max(
+                pc_score,
+                tpl_score if ANOMALIB_TEMPLATE_GATE_ENABLED else 0.0,
+                float(h_score) * 5.0,
+            )
+        )
+
+        # ── 破洞专项告警栏 ────────────────────────────────────────────
+        if h_score > ANOMALIB_HOLE_FAIL_THRESH:
+            hole_pct = h_score * 100
             st.markdown(
-                metric_row_html([
-                    ("定位方式", calib_flag),
-                    ("覆膜率",   f"{film_pct:.1f}%"),
-                    ("相似度",   f"{sim_pct:.0f}%"),
-                    ("定位置信度", f"{loc_score:.3f}"),
-                    ("异常框",   f"{miss_cnt}"),
-                ]),
+                f"""
+<div style="background:#fff0f0; border:2px solid #dc3545; border-radius:10px;
+     padding:14px 18px; margin:10px 0; display:flex; align-items:center; gap:14px;">
+  <span style="font-size:2rem;">⚠️</span>
+  <div>
+    <div style="font-size:1.05rem; font-weight:700; color:#dc3545;">
+      检测到明显破损 / 破洞区域
+    </div>
+    <div style="font-size:0.88rem; color:#555; margin-top:4px;">
+      破损面积占比 <b>{hole_pct:.1f}%</b> · 共 <b>{len(h_boxes)}</b> 处
+    </div>
+  </div>
+</div>
+""",
                 unsafe_allow_html=True,
             )
 
-            ann = result.get("annotated_image")
-            if ann is not None:
+        st.markdown("### 异常热图")
+        col_heat, col_ainfo = st.columns([1.4, 1], gap="large")
+
+        with col_heat:
+            step_header("热图（JET：蓝→红 异常程度递增）")
+            if a_overlay is not None:
                 st.image(
-                    bgr_to_rgb(ann),
-                    caption="标注图（黄框=产品区域 | 红框=异常区域）",
+                    bgr_to_rgb(a_overlay),
+                    caption=(
+                        f"PatchCore {pc_score:.3f} | 模板 {tpl_score:.3f}"
+                        f"{' (参与判阈 {:.2f})'.format(tpl_thr) if ANOMALIB_TEMPLATE_GATE_ENABLED else ' (仅展示)'} "
+                        f"| 破洞 {h_score*100:.1f}% | {a_status}"
+                    ),
                     use_container_width=True,
                 )
             else:
-                st.warning("未能生成标注图。")
+                st.info("热图未生成")
 
-            if show_cutout:
-                cut = result.get("cutout_image")
-                if cut is not None:
-                    st.markdown("**白底抠图（产品主体）**")
-                    st.image(cut, caption="GrabCut 抠图结果（灰度白底）",
-                             use_container_width=True)
-
-            if show_detail:
-                st.markdown("---")
-                st.markdown("**🔧 调试详情**")
-                q = result.get("quality", {})
-                dc = st.columns(5)
-                dc[0].metric("清晰度",   f"{q.get('sharpness', 0):.1f}")
-                dc[1].metric("纹理比",   f"{q.get('texture_ratio', 0):.3f}")
-                dc[2].metric("反光比",   f"{q.get('reflection_ratio', 0):.3f}")
-                dc[3].metric("过曝率",   f"{q.get('overexpose_ratio', 0)*100:.1f}%")
-                dc[4].metric("欠曝率",   f"{q.get('underexpose_ratio', 0)*100:.1f}%")
-                st.markdown(
-                    f"- **最佳匹配标准图**: `{result.get('best_ref_name', '—')}`  \n"
-                    f"- **产品定位框**: `{result.get('bbox')}`  \n"
-                    f"- **ORB 匹配点**: `{result.get('score', 0)}`"
-                )
-                if result["missing_regions"]:
-                    st.markdown("**异常区域坐标：**")
-                    for i, box in enumerate(result["missing_regions"], 1):
-                        st.code(f"[{i}] x1={box[0]} y1={box[1]} x2={box[2]} y2={box[3]}")
-
-
-# ════════════════════════════════════════════════════════════════════════
-# Tab 2 — ROI 标定
-# ════════════════════════════════════════════════════════════════════════
-with tab_calib:
-    st.subheader("📐 产品区域 ROI 标定")
-    st.info(
-        "固定相机安装后，只需标定一次。上传一张清晰的产品图，"
-        "用滑块框出产品所在区域，保存后检测时将自动跳过不稳定的模板匹配，"
-        "直接使用标定区域，大幅提升定位准确率。"
-    )
-
-    if not selected_view:
-        st.warning("请先在左侧侧边栏选择检测视角。")
-    else:
-        st.markdown(f"**当前视角：{selected_label}**")
-
-        # 显示已有标定信息
-        existing = load_calibration(selected_view)
-        if existing:
-            p = _CALIB_DIR / f"{selected_view}.json"
-            info = json.loads(p.read_text(encoding="utf-8"))
-            st.success(
-                f"已有标定：ROI = {[f'{v:.3f}' for v in existing]}  |  "
-                f"标定时间：{info.get('created_at', '未知')}"
+        with col_ainfo:
+            step_header("关键分数")
+            pc_color = "#dc3545" if pc_score > anomalib_threshold else (
+                "#ffc107" if pc_score > anomalib_threshold * 0.75 else "#28a745"
             )
-            if st.button("🗑️ 清除标定（恢复自动定位）", key="clear_calib"):
-                (p).unlink(missing_ok=True)
-                st.rerun()
+            if ANOMALIB_TEMPLATE_GATE_ENABLED:
+                tpl_color = "#dc3545" if tpl_score > tpl_thr else (
+                    "#ffc107" if tpl_score > tpl_thr * 0.75 else "#28a745"
+                )
+            else:
+                tpl_color = "#6c757d"
+            hole_color = "#dc3545" if h_score > ANOMALIB_HOLE_FAIL_THRESH else "#28a745"
+            st.markdown(
+                f"""
+<div style="text-align:center; padding:12px; border-radius:10px;
+     background:#f8f9fa; border: 2px solid {pc_color}; margin-bottom:8px">
+  <div style="font-size:0.78rem; color:#666; margin-bottom:2px">PatchCore 异常分</div>
+  <div style="font-size:1.5rem; font-weight:700; color:{pc_color}">{pc_score:.3f}</div>
+  <div style="font-size:0.82rem; color:#444; margin-top:4px">阈值 {anomalib_threshold:.2f}</div>
+</div>
+<div style="text-align:center; padding:12px; border-radius:10px;
+     background:#f8f9fa; border: 2px solid {tpl_color}; margin-bottom:8px">
+  <div style="font-size:0.78rem; color:#666; margin-bottom:2px">模板一致性（ORB 残差）</div>
+  <div style="font-size:1.5rem; font-weight:700; color:{tpl_color}">{tpl_score:.3f}</div>
+  <div style="font-size:0.82rem; color:#444; margin-top:4px">阈值 {tpl_thr:.2f}
+    ({'参与终判' if ANOMALIB_TEMPLATE_GATE_ENABLED else '仅展示，不参与终判'})</div>
+</div>
+<div style="text-align:center; padding:10px; border-radius:10px;
+     background:#fafafa; border: 1px dashed #bbb; margin-bottom:10px; font-size:0.78rem; color:#555">
+  综合展示 max {combo_max:.3f}
+  （{'PatchCore、模板、破洞×5 取最大后按分项 OR 判 FAIL' if ANOMALIB_TEMPLATE_GATE_ENABLED else '当前未计模板；PatchCore 与 破洞×5 取最大，按 PatchCore/破洞 OR 判 FAIL'}）
+</div>
+<div style="text-align:center; padding:12px; border-radius:10px;
+     background:#f8f9fa; border: 2px solid {hole_color}; margin-bottom:10px">
+  <div style="font-size:0.78rem; color:#666; margin-bottom:2px">破损面积占比</div>
+  <div style="font-size:2.0rem; font-weight:700; color:{hole_color}">{h_score*100:.1f}%</div>
+  <div style="font-size:0.82rem; color:#444; margin-top:4px">共 {len(h_boxes)} 处</div>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+            if a_status == "FAIL" and anomalib_result.get("issues"):
+                step_header("不通过原因")
+                for iss in anomalib_result["issues"]:
+                    st.warning(iss)
+            if a_status == "FAIL":
+                st.error("检测不通过（见上方分项与原因）")
+            elif a_status == "PASS":
+                st.success("检测通过")
+            else:
+                st.info("未检测")
 
-        st.markdown("---")
-        st.markdown("#### 操作步骤")
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════════════════
+    # 区域二：综合判定结果
+    # ════════════════════════════════════════════════════════════════════
+    st.markdown("### 结论")
+
+    col_verdict, col_metrics = st.columns([1, 1.6], gap="large")
+
+    with col_verdict:
+        st.markdown(verdict_html(status, issues[:1], []), unsafe_allow_html=True)
+
+    with col_metrics:
+        step_header("关键指标")
+        _a_score_str = (
+            f"{anomalib_result.get('anomaly_score', 0.0):.3f}"
+            if anomalib_result else "—"
+        )
+        _a_status_str = (
+            anomalib_result.get("status", "SKIP")
+            if anomalib_result else "未运行"
+        )
         st.markdown(
-            "1. 上传一张相机实际拍摄的产品图  \n"
-            "2. 调整下方四个滑块，让绿色方框恰好框住产品主体（略有余量即可）  \n"
-            "3. 点击「💾 保存标定」完成"
+            metric_row([
+                ("Anomalib分",  _a_score_str),
+                ("Anomalib判定", _a_status_str),
+                ("覆膜率",      f"{film_pct:.1f}%"),
+                ("偏斜角",      f"{pose_angle:.1f}°"),
+            ]),
+            unsafe_allow_html=True,
         )
 
-        calib_upload = st.file_uploader(
-            "上传标定参考图（PNG / JPG / BMP）",
-            type=["png", "jpg", "jpeg", "bmp"],
-            key="calib_upload",
-        )
-
-        if calib_upload:
-            calib_bgr = bytes_to_bgr(calib_upload.read())
-            if calib_bgr is None:
-                st.error("图片解码失败，请重新上传。")
-            else:
-                ch, cw = calib_bgr.shape[:2]
-
-                # 默认值：先看是否有已有标定
-                default_rel = existing if existing else [0.05, 0.05, 0.95, 0.95]
-
-                c_sl, c_prev = st.columns([1, 1.8], gap="large")
-
-                with c_sl:
-                    st.markdown("**拖动滑块调整 ROI 边界（百分比）**")
-                    x1_pct = st.slider("左边界 ←",  0, 99,
-                                       int(default_rel[0] * 100), key="cx1")
-                    y1_pct = st.slider("上边界 ↑",  0, 99,
-                                       int(default_rel[1] * 100), key="cy1")
-                    x2_pct = st.slider("右边界 →",  1, 100,
-                                       int(default_rel[2] * 100), key="cx2")
-                    y2_pct = st.slider("下边界 ↓",  1, 100,
-                                       int(default_rel[3] * 100), key="cy2")
-
-                    # 校验：左 < 右，上 < 下
-                    if x1_pct >= x2_pct:
-                        st.warning("左边界必须小于右边界")
-                    elif y1_pct >= y2_pct:
-                        st.warning("上边界必须小于下边界")
-                    else:
-                        new_roi = [
-                            x1_pct / 100, y1_pct / 100,
-                            x2_pct / 100, y2_pct / 100,
-                        ]
-                        abs_box = calib_to_abs(new_roi, cw, ch)
-                        roi_w = abs_box[2] - abs_box[0]
-                        roi_h = abs_box[3] - abs_box[1]
-                        st.markdown(
-                            f"**ROI 尺寸**：{roi_w} × {roi_h} px  \n"
-                            f"**ROI 坐标**：({abs_box[0]}, {abs_box[1]}) → "
-                            f"({abs_box[2]}, {abs_box[3]})"
-                        )
-
-                        if st.button("💾 保存标定", type="primary", key="save_calib"):
-                            save_calibration(selected_view, new_roi, (cw, ch))
-                            st.success(
-                                f"标定已保存！下次检测 **{selected_label}** 视角时将自动使用此 ROI。"
-                            )
-                            st.rerun()
-
-                with c_prev:
-                    st.markdown("**预览（绿框 = 当前 ROI）**")
-                    if x1_pct < x2_pct and y1_pct < y2_pct:
-                        preview_roi = [
-                            x1_pct / 100, y1_pct / 100,
-                            x2_pct / 100, y2_pct / 100,
-                        ]
-                        preview_img = draw_roi_preview(calib_bgr, preview_roi)
-                        st.image(
-                            bgr_to_rgb(preview_img),
-                            caption=f"标定参考图  {cw}×{ch}px",
-                            use_container_width=True,
-                        )
-                    else:
-                        st.image(
-                            bgr_to_rgb(calib_bgr),
-                            caption=f"标定参考图  {cw}×{ch}px",
-                            use_container_width=True,
-                        )
-        else:
-            st.markdown(
-                "_上传图片后，此处将显示带 ROI 标注框的预览图。_"
-            )
-
-
-# ════════════════════════════════════════════════════════════════════════
-# Tab 3 — 实时监控 Demo（PC 模拟流水线触发）
-# ════════════════════════════════════════════════════════════════════════
-with tab_monitor:
-    from src.trigger import ProductTrigger
-
-    st.subheader("📷 实时监控 Demo — 流水线触发模拟")
-    st.info(
-        "**PC Demo 模式**：上传一批模拟帧图片（模拟摄像头连续抓帧），"
-        "系统自动分析每帧的产品占比，找出产品完整进入镜头的触发时机，"
-        "并对触发帧执行 Stage 1 检测。  \n"
-        "**迁移到树莓派**：只需将 MockCamera 换成 PiCamera，其余代码零修改。"
-    )
-
-    if not selected_view:
-        st.warning("请先在左侧侧边栏选择检测视角。")
-    elif roi_rel is None:
-        st.warning("请先在「📐 ROI 标定」页面完成标定，监控模式依赖标定 ROI。")
-    elif detector is None:
-        st.warning("检测器未加载，请检查标准图库路径。")
-    else:
-        # ── 参数配置 ───────────────────────────────────────────────────
-        st.markdown("#### ① 触发 & 连拍参数配置")
-        cfg_col1, cfg_col2, cfg_col3, cfg_col4, cfg_col5 = st.columns(5)
-        with cfg_col1:
-            fill_threshold = st.slider(
-                "产品占比触发阈值",
-                min_value=0.50, max_value=1.00, value=0.95, step=0.01,
-                help="ROI 内深色像素占比超过此值，且连续稳定，才触发拍照",
-            )
-        with cfg_col2:
-            stable_frames = st.slider(
-                "稳定帧数",
-                min_value=2, max_value=8, value=4,
-                help="连续多少帧满足条件才触发（越大越稳定，越慢响应）",
-            )
-        with cfg_col3:
-            dark_thresh = st.slider(
-                "深色像素阈值（灰度）",
-                min_value=60, max_value=180, value=110,
-                help="灰度值低于此数值的像素视为产品前景（电饭煲为深色）",
-            )
-        with cfg_col4:
-            burst_count = st.slider(
-                "连拍张数",
-                min_value=1, max_value=5, value=3,
-                help="触发后连续拍摄的张数，从中选最清晰的一张送检测",
-            )
-        with cfg_col5:
-            burst_interval = st.slider(
-                "连拍间隔 (ms)",
-                min_value=1, max_value=50, value=5,
-                help="每两次连拍之间的时间间隔（毫秒）",
-            )
-
-        st.markdown("---")
-
-        # ── 上传模拟帧 ─────────────────────────────────────────────────
-        st.markdown("#### ② 上传模拟帧序列（按顺序上传，模拟摄像头连续抓帧）")
-        frame_files = st.file_uploader(
-            "支持 PNG / JPG / BMP，可多选",
-            type=["png", "jpg", "jpeg", "bmp"],
-            accept_multiple_files=True,
-            key="monitor_frames",
-        )
-
-        if not frame_files:
-            st.markdown(
-                "_提示：可把同一视角的多张图片一次性拖入，系统会按文件名顺序分析。_"
-            )
-        else:
-            frame_files = sorted(frame_files, key=lambda f: f.name)
-            n_frames    = len(frame_files)
-            st.caption(f"已上传 {n_frames} 帧")
-
-            # ── 逐帧分析占比 ───────────────────────────────────────────
-            trigger = ProductTrigger(
-                camera            = None,   # type: ignore  # Demo 模式不用相机对象
-                roi_rel           = roi_rel,
-                fill_threshold    = fill_threshold,
-                stable_frames     = stable_frames,
-                dark_thresh       = dark_thresh,
-                burst_count       = burst_count,
-                burst_interval_ms = float(burst_interval),
-            )
-
-            fill_ratios:     list[float]          = []
-            triggered_idxs:  list[int]            = []   # 触发帧在帧序列中的索引
-            burst_groups:    list[list[int]]       = []   # 每次触发对应的连拍帧索引组
-
-            frames_bgr: list[np.ndarray] = []
-            for ff in frame_files:
-                bgr = bytes_to_bgr(ff.read())
-                frames_bgr.append(bgr)
-                fill = trigger.compute_fill_ratio(bgr) if bgr is not None else 0.0
-                fill_ratios.append(fill)
-                if trigger.check_trigger(fill):
-                    tidx = len(fill_ratios) - 1
-                    triggered_idxs.append(tidx)
-                    # Demo 模式：连拍取触发帧及其后续帧（模拟时序）
-                    group = [
-                        min(tidx + i, n_frames - 1)
-                        for i in range(burst_count)
-                    ]
-                    burst_groups.append(group)
-                    trigger.reset()
-
-            # ── 帧序列概览 ─────────────────────────────────────────────
-            st.markdown("#### ③ 帧序列概览")
-            import math
-            cols_per_row = 5
-            n_rows = math.ceil(n_frames / cols_per_row)
-
-            triggered_set = set(triggered_idxs)
-            for row in range(n_rows):
-                cols = st.columns(cols_per_row)
-                for col_idx, col in enumerate(cols):
-                    frame_idx = row * cols_per_row + col_idx
-                    if frame_idx >= n_frames:
-                        break
-                    fill   = fill_ratios[frame_idx]
-                    is_trg = frame_idx in triggered_set
-                    bgr_f  = frames_bgr[frame_idx]
-                    fname  = frame_files[frame_idx].name
-
-                    with col:
-                        if bgr_f is not None:
-                            thumb = draw_roi_preview(bgr_f, roi_rel) if is_trg else bgr_f
-                            st.image(bgr_to_rgb(thumb), use_container_width=True)
-                        border = "3px solid #28a745" if is_trg else "1px solid #dee2e6"
-                        bg     = "#d4edda"            if is_trg else "#f8f9fa"
-                        label  = "📸 触发"             if is_trg else f"{fill*100:.0f}%"
-                        st.markdown(
-                            f'<div style="border:{border};background:{bg};'
-                            f'border-radius:6px;padding:4px 6px;text-align:center;'
-                            f'font-size:0.78rem;">'
-                            f'<b>{label}</b><br>'
-                            f'<span style="color:#555">{fname}</span>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-
-            st.markdown("---")
-
-            # ── 连拍结果 + Stage 1 检测 ────────────────────────────────
-            if triggered_idxs:
+        # Anomalib 异常框列表
+        if anomalib_result and anomalib_result.get("anomaly_boxes"):
+            step_header("异常区域")
+            for i, box in enumerate(anomalib_result["anomaly_boxes"], 1):
+                x1, y1, x2, y2 = box
                 st.markdown(
-                    f"#### ④ 连拍结果 & Stage 1 检测（共触发 {len(triggered_idxs)} 次）"
+                    f"异常{i}: ({x1}, {y1}) → ({x2}, {y2})"
                 )
-                for rank, (tidx, group) in enumerate(
-                    zip(triggered_idxs, burst_groups), 1
-                ):
-                    fname = frame_files[tidx].name
-                    with st.expander(
-                        f"触发事件 [{rank}]  —  {fname}  "
-                        f"（占比 {fill_ratios[tidx]*100:.1f}%）",
-                        expanded=(rank == 1),
-                    ):
-                        # 获取连拍帧列表（Demo: 取对应索引的帧）
-                        burst_imgs = [
-                            frames_bgr[i] for i in group
-                            if frames_bgr[i] is not None
-                        ]
-
-                        # 计算每张清晰度分数
-                        scores = ProductTrigger.sharpness_scores(burst_imgs)
-                        best_result = ProductTrigger.select_sharpest(burst_imgs)
-
-                        # ── 连拍三张对比展示 ───────────────────────────
-                        st.markdown(
-                            f"**连拍 {len(burst_imgs)} 张**"
-                            f"（间隔 {burst_interval} ms 一张，"
-                            f"自动选最清晰帧送检测）"
-                        )
-                        burst_cols = st.columns(len(burst_imgs))
-                        for bi, (bc, bimg, bscore) in enumerate(
-                            zip(burst_cols, burst_imgs, scores)
-                        ):
-                            is_best = (best_result is not None and bi == best_result[0])
-                            with bc:
-                                st.image(
-                                    bgr_to_rgb(bimg),
-                                    caption=(
-                                        f"第 {bi+1} 张  +{bi*burst_interval}ms\n"
-                                        f"清晰度 {bscore:.0f}"
-                                    ),
-                                    use_container_width=True,
-                                )
-                                if is_best:
-                                    st.markdown(
-                                        '<div style="text-align:center;'
-                                        'color:#155724;font-weight:700;'
-                                        'font-size:0.82rem;">✅ 最清晰，送检</div>',
-                                        unsafe_allow_html=True,
-                                    )
-
-                        # ── Stage 1 检测（最清晰帧） ───────────────────
-                        st.markdown("---")
-                        if best_result is None:
-                            st.error("连拍帧全部解码失败。")
-                        else:
-                            best_idx, best_img = best_result
-                            h_b, w_b = best_img.shape[:2]
-                            calib_bbox_b = calib_to_abs(roi_rel, w_b, h_b)
-
-                            with st.spinner("正在对最清晰帧执行 Stage 1 检测..."):
-                                res = detector.inspect_with_localization(
-                                    best_img,
-                                    min_match_count=match_thresh,
-                                    missing_regions_fail_count=missing_thresh,
-                                    calibrated_bbox=calib_bbox_b,
-                                )
-
-                            rc1, rc2 = st.columns([1, 1.5])
-                            with rc1:
-                                st.image(
-                                    bgr_to_rgb(best_img),
-                                    caption=f"送检帧（第 {best_idx+1} 张）",
-                                    use_container_width=True,
-                                )
-                            with rc2:
-                                st.markdown(
-                                    status_card(
-                                        res["status"], res["issues"], res["warnings"]
-                                    ),
-                                    unsafe_allow_html=True,
-                                )
-                                st.markdown(
-                                    metric_row_html([
-                                        ("覆膜率", f"{res['film_coverage']*100:.1f}%"),
-                                        ("相似度", f"{res['similarity']*100:.0f}%"),
-                                        ("异常框", f"{len(res['missing_regions'])}"),
-                                    ]),
-                                    unsafe_allow_html=True,
-                                )
-                                ann = res.get("annotated_image")
-                                if ann is not None:
-                                    st.image(
-                                        bgr_to_rgb(ann),
-                                        caption="标注图（黄框=产品 | 红框=异常）",
-                                        use_container_width=True,
-                                    )
-            else:
-                st.warning(
-                    f"未找到触发帧（阈值={fill_threshold:.0%}）。"
-                    "建议降低占比阈值，或检查深色像素阈值设置。"
-                )
-
-        # ── 树莓派迁移指南 ─────────────────────────────────────────────
-        st.markdown("---")
-        with st.expander("🔧 树莓派迁移指南（点击展开）"):
-            st.markdown("""
-**只需修改两处，其他代码零改动：**
-
-**第 1 处** — 相机实例化（`src/trigger.py` 已预留）
-```python
-# PC Demo（当前）
-from src.trigger import MockCamera
-cam = MockCamera(image_folder="path/to/frames", fps=5)
-
-# 树莓派（迁移后，取消 PiCamera.start() 里的注释即可）
-from src.trigger import PiCamera
-cam = PiCamera(resolution=(1280, 960), exposure_us=2000)
-```
-
-**第 2 处** — 主循环（替换 Streamlit 上传为 GPIO/相机循环）
-```python
-cam.start()
-trigger = ProductTrigger(cam, roi_rel=roi_rel)
-while True:
-    frame = cam.capture_frame()
-    fill  = trigger.compute_fill_ratio(frame)
-    if trigger.check_trigger(fill):
-        hires  = cam.capture_hires()
-        result = detector.inspect_with_localization(
-            hires, calibrated_bbox=calib_to_abs(roi_rel, *hires.shape[1::-1])
-        )
-        # → 上报结果 / 控制流水线
-        trigger.reset()
-```
-
-**曝光建议**
-- 曝光时间：先从 2000μs 开始，根据实际亮度调整
-- 关闭自动曝光（`AeEnable=False`）避免过曝/欠曝
-- 可配合 LED 环形补光灯稳定光照
-            """)
-

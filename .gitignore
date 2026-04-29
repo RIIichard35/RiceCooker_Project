@@ -37,6 +37,10 @@ data/*.db
 *.swp
 *.swo
 
+# Logs
+*.log
+debug-*.log
+
 # OS
 .DS_Store
 Thumbs.db

@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -24,7 +23,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import (
-    CALIB_DIR,
     FILM_COVERAGE_THRESHOLD,
     MAX_MISSING_COUNT,
     MIN_MATCH_COUNT,
@@ -32,12 +30,11 @@ from src.config import (
     STANDARDS_DIR,
 )
 from src.stage1_vision import Stage1Detector
-from src.stage2_scratch import Stage2Detector
+from src.stage3_yolov8 import Stage2Detector
 
 # ── 默认路径 ─────────────────────────────────────────────────────────────
 _ONNX_PATH  = Path(MODELS_DIR) / "best20240919.onnx"
 _STD_ROOT   = Path(STANDARDS_DIR)
-_CALIB_DIR  = Path(CALIB_DIR)
 
 # ── 页面配置 ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -49,24 +46,45 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.card { padding:18px 22px; border-radius:10px; text-align:center;
-        margin-bottom:14px; font-family:"Microsoft YaHei",sans-serif; }
-.card-pass   { background:#d4edda; color:#155724; border:1px solid #c3e6cb; }
-.card-fail   { background:#f8d7da; color:#721c24; border:1px solid #f5c6cb; }
-.card-retake { background:#fff3cd; color:#856404; border:1px solid #ffeeba; }
-.card-skip   { background:#e2e3e5; color:#383d41; border:1px solid #d6d8db; }
+/* ── 整体字体（与 app1 一致） ── */
+html, body, [class*="css"] { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }
 
-.metric-row { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0; }
-.metric-box { flex:1; min-width:100px; background:#f0f2f6;
-              border-radius:8px; padding:10px 8px; text-align:center; }
-.metric-label { font-size:0.72rem; color:#555; margin-bottom:4px; }
-.metric-value { font-size:1.15rem; font-weight:700; color:#222; }
+/* ── 结论卡片 ── */
+.verdict-card {
+    padding: 20px 28px; border-radius: 12px;
+    text-align: center; margin-bottom: 16px;
+}
+.verdict-card h2 { margin: 0 0 10px; font-size: 1.5rem; }
+.verdict-card p { margin: 3px 0; font-size: 0.88rem; line-height: 1.35; }
+.verdict-pass   { background: #d4edda; color: #155724; border: 2px solid #28a745; }
+.verdict-fail   { background: #f8d7da; color: #721c24; border: 2px solid #dc3545; }
+.verdict-retake { background: #fff3cd; color: #856404; border: 2px solid #ffc107; }
+.verdict-skip   { background: #e2e3e5; color: #383d41; border: 2px solid #d6d8db; }
 
-.stage-divider { font-size:1.1rem; font-weight:700; color:#444;
-                 border-left:4px solid #0078d4; padding-left:10px;
-                 margin:16px 0 8px; }
-.issue-item { color:#721c24; margin:3px 0; }
-.warn-item  { color:#856404; margin:3px 0; }
+/* ── 指标行 ── */
+.metric-row { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px; }
+.metric-box {
+    flex: 1; min-width: 100px; background: #f0f2f6;
+    border-radius: 8px; padding: 10px 6px; text-align: center;
+}
+.metric-label { font-size: 0.70rem; color: #666; margin-bottom: 4px; }
+.metric-value { font-size: 1.15rem; font-weight: 700; color: #222; }
+
+/* ── 流程步骤标题 ── */
+.step-header {
+    font-size: 0.85rem; font-weight: 700; color: #0078d4;
+    border-left: 3px solid #0078d4; padding-left: 8px;
+    margin: 14px 0 6px;
+}
+
+.issue-item { color: #721c24; margin: 3px 0; font-size: 0.88rem; }
+.warn-item  { color: #856404; margin: 3px 0; font-size: 0.88rem; }
+
+/* 细筛页：展示图下边距收紧 */
+section.main [data-testid="stImage"] { margin-bottom: 0.15rem !important; }
+section.main div[data-testid="stMarkdownContainer"] hr {
+  margin: 0.35rem 0 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -76,29 +94,52 @@ st.markdown("""
 def bgr_to_rgb(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+
+def bgra_to_rgba(img: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+
+
+def cutout_to_display(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    if img.ndim == 3 and img.shape[2] == 4:
+        return bgra_to_rgba(img)
+    return bgr_to_rgb(img)
+
+
 def bytes_to_bgr(data: bytes) -> np.ndarray | None:
     arr = np.frombuffer(data, dtype=np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-def card_html(status: str, issues: list[str], warnings: list[str],
-              title_override: str = "") -> str:
-    css   = {"PASS":"card-pass","FAIL":"card-fail",
-             "RETAKE":"card-retake","SKIP":"card-skip"}
-    icon  = {"PASS":"✅","FAIL":"❌","RETAKE":"⚠️","SKIP":"⏭️"}
-    label = {"PASS":"通过","FAIL":"不合格","RETAKE":"需要重拍","SKIP":"已跳过"}
-    c = css.get(status, "card-fail")
+def verdict_card_html(
+    status: str,
+    issues: list[str],
+    warnings: list[str],
+    title: str = "",
+) -> str:
+    """与 app1 verdict 样式一致；可传入 title 覆盖默认文案（细筛多阶段）。"""
+    css = {"PASS": "verdict-pass", "FAIL": "verdict-fail",
+           "RETAKE": "verdict-retake", "SKIP": "verdict-skip"}
+    icon = {"PASS": "✅", "FAIL": "❌", "RETAKE": "⚠️", "SKIP": "⏭️"}
+    default_l = {"PASS": "初筛通过", "FAIL": "初筛不合格",
+                 "RETAKE": "需要重拍", "SKIP": "已跳过"}
+    c = css.get(status, "verdict-fail")
     i = icon.get(status, "❓")
-    l = title_override or label.get(status, status)
+    l = title or default_l.get(status, status)
     issues_html = "".join(
         f'<p class="issue-item">⛔ {s}</p>' for s in issues
-    ) if issues else '<p style="color:#155724">无问题</p>'
+    ) if issues else '<p style="color:#155724;font-size:0.88rem">无阻断性问题</p>'
     warns_html = "".join(
         f'<p class="warn-item">⚠ {w}</p>' for w in warnings
     ) if warnings else ""
-    return (f'<div class="card {c}"><h2 style="margin:0 0 8px">{i} {l}</h2>'
-            f'{issues_html}{warns_html}</div>')
+    return (
+        f'<div class="verdict-card {c}">'
+        f'<h2 style="margin:0 0 10px;font-size:1.5rem">{i} {l}</h2>'
+        f'{issues_html}{warns_html}</div>'
+    )
 
-def metric_html(metrics: list[tuple[str, str]]) -> str:
+
+def metric_row(metrics: list[tuple[str, str]]) -> str:
     boxes = "".join(
         f'<div class="metric-box">'
         f'<div class="metric-label">{lb}</div>'
@@ -107,49 +148,67 @@ def metric_html(metrics: list[tuple[str, str]]) -> str:
     )
     return f'<div class="metric-row">{boxes}</div>'
 
-def load_calibration(view: str) -> list | None:
-    p = _CALIB_DIR / f"{view}.json"
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8")).get("roi_rel")
-    except Exception:
-        return None
 
-def calib_to_abs(roi_rel: list, w: int, h: int) -> list:
-    return [int(roi_rel[0]*w), int(roi_rel[1]*h),
-            int(roi_rel[2]*w), int(roi_rel[3]*h)]
+def step_header(text: str) -> None:
+    st.markdown(f'<div class="step-header">{text}</div>', unsafe_allow_html=True)
 
-def save_calibration(view: str, roi_rel: list, ref_wh: tuple) -> None:
-    from datetime import datetime
-    _CALIB_DIR.mkdir(parents=True, exist_ok=True)
-    data = {
-        "view":       view,
-        "roi_rel":    roi_rel,
-        "ref_size":   list(ref_wh),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    (_CALIB_DIR / f"{view}.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
 
-def draw_roi_preview(img_bgr: np.ndarray, roi_rel: list) -> np.ndarray:
-    h, w = img_bgr.shape[:2]
-    x1, y1, x2, y2 = calib_to_abs(roi_rel, w, h)
-    vis     = img_bgr.copy()
-    overlay = vis.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 200, 0), -1)
-    cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, vis)
-    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 3)
-    cv2.putText(vis, f"ROI  {x2-x1}x{y2-y1}px",
-                (x1, max(22, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 200, 0), 2)
+def stage2_crop_with_defects(
+    crop_bgr: np.ndarray,
+    defects: list,
+    crop_box: list | None,
+) -> np.ndarray:
+    """在 Stage2 产品裁剪图（BGR）上绘制缺陷框，坐标从全图换算为裁剪图局部。"""
+    if crop_bgr is None or crop_bgr.size == 0 or not crop_box:
+        return crop_bgr
+    vis = crop_bgr.copy()
+    ch, cw = vis.shape[:2]
+    cx1, cy1, _, _ = (int(crop_box[0]), int(crop_box[1]),
+                      int(crop_box[2]), int(crop_box[3]))
+    for d in defects or []:
+        ox1, oy1, ox2, oy2 = (int(d["xyxy"][0]), int(d["xyxy"][1]),
+                              int(d["xyxy"][2]), int(d["xyxy"][3]))
+        lx1 = ox1 - cx1
+        ly1 = oy1 - cy1
+        lx2 = ox2 - cx1
+        ly2 = oy2 - cy1
+        lx1 = max(0, min(lx1, cw - 1))
+        ly1 = max(0, min(ly1, ch - 1))
+        lx2 = max(0, min(lx2, cw))
+        ly2 = max(0, min(ly2, ch))
+        if lx2 <= lx1 or ly2 <= ly1:
+            continue
+        cls_name = d.get("class_name", "")
+        score = float(d.get("score", 0.0))
+        color = (0, 0, 220) if cls_name == "scratch" else (0, 100, 255)
+        cv2.rectangle(vis, (lx1, ly1), (lx2, ly2), color, 2)
+        label = f"{cls_name} {score:.2f}"
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        lab_y = ly1 - 4
+        if lab_y < lh + 8:
+            lab_y = min(ch - 1, ly2 + lh + 8)
+        cv2.rectangle(
+            vis,
+            (lx1, lab_y - lh - 6),
+            (lx1 + lw + 4, lab_y),
+            color,
+            -1,
+        )
+        cv2.putText(
+            vis,
+            label,
+            (lx1 + 2, lab_y - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+        )
     return vis
 
 
 # ── 视角映射 ─────────────────────────────────────────────────────────────
-VIEW_LABELS = {"front":"正面","back":"后面","left":"左面",
-               "right":"右面","top":"顶部"}
+VIEW_LABELS = {"front": "正面", "back": "后面", "left": "左面",
+               "right": "右面", "top": "顶部"}
 
 if _STD_ROOT.exists():
     available_views = sorted(
@@ -172,28 +231,16 @@ selected_label: str | None = st.sidebar.selectbox(
 )
 selected_view = view_map.get(selected_label, selected_label) if selected_label else None
 
-# 标定状态
-if selected_view:
-    roi_rel = load_calibration(selected_view)
-    badge = "📐 ROI 已标定" if roi_rel else "📐 ROI 未标定（自动定位）"
-    color = "#d4edda" if roi_rel else "#fff3cd"
-    st.sidebar.markdown(
-        f'<span style="background:{color};padding:4px 10px;'
-        f'border-radius:6px;font-size:0.82rem;">{badge}</span>',
-        unsafe_allow_html=True,
-    )
-else:
-    roi_rel = None
-
 st.sidebar.markdown("---")
-st.sidebar.subheader("Stage 1 阈值")
-film_thresh    = st.sidebar.slider("塑料膜阈值 (%)", 10, 90,
-                                   int(FILM_COVERAGE_THRESHOLD * 100), 5)
-match_thresh   = st.sidebar.slider("ORB 匹配点", 5, 60, MIN_MATCH_COUNT)
+st.sidebar.subheader("检测阈值（Stage 1）")
+film_thresh = st.sidebar.slider(
+    "塑料膜阈值 (%)", 10, 90, int(FILM_COVERAGE_THRESHOLD * 100), 5,
+)
+match_thresh = st.sidebar.slider("ORB 匹配点", 5, 60, MIN_MATCH_COUNT)
 missing_thresh = st.sidebar.slider("缺件框阈值", 1, 10, MAX_MISSING_COUNT)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Stage 2 阈值")
+st.sidebar.subheader("检测阈值（Stage 2）")
 conf_thresh = st.sidebar.slider(
     "划痕置信度", 0.05, 0.90, 0.25, 0.05,
     help="YOLO 检测框的最低置信度，越低越灵敏",
@@ -208,7 +255,10 @@ roi_padding = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-show_crop   = st.sidebar.checkbox("显示产品裁剪图", value=True)
+show_crop   = st.sidebar.checkbox(
+    "Stage 2 横向显示裁剪图", value=True,
+    help="开启时与全图标注左右并列；关闭时仅显示全图标注。",
+)
 show_detail = st.sidebar.checkbox("显示调试详情", value=False)
 
 
@@ -246,327 +296,244 @@ else:
 
 # ── 主界面 ───────────────────────────────────────────────────────────────
 st.title("🔎 电饭煲外观细筛系统（Stage 1 → Stage 2）")
-st.caption("先通过 Stage 1 结构初筛，通过后在产品区域内执行 YOLO 划痕/裂纹检测")
+st.caption("整图检测 · 标签保留 · 姿态评估 → Stage 1 初筛 → Stage 2 YOLO 划痕/裂纹检测")
 st.markdown("---")
 
-tab_detect, tab_calib = st.tabs(["🔎  检测", "📐  ROI 标定"])
 
 # ════════════════════════════════════════════════════════════════════════
-# Tab 1 — 检测
+# 检测
 # ════════════════════════════════════════════════════════════════════════
-with tab_detect:
-    col_up, col_res = st.columns([1, 1.8], gap="large")
+col_up, col_res = st.columns([1, 1.8], gap="large")
 
-    # ── 左：上传 ─────────────────────────────────────────────────────────
-    with col_up:
-        st.subheader("① 上传待测图片")
-        uploaded = st.file_uploader(
-            "拖拽或点击上传（PNG / JPG / BMP）",
-            type=["png","jpg","jpeg","bmp"],
-            label_visibility="collapsed",
-        )
-        img_bgr: np.ndarray | None = None
-        if uploaded:
-            img_bgr = bytes_to_bgr(uploaded.read())
-            if img_bgr is not None:
-                h, w = img_bgr.shape[:2]
-                st.image(bgr_to_rgb(img_bgr),
-                         caption=f"待测原图  {w}×{h}px", width="stretch")
-            else:
-                st.error("图片解码失败，请重新上传。")
-
-    # ── 右：结果 ─────────────────────────────────────────────────────────
-    with col_res:
-        st.subheader("② 检测结果")
-
-        if img_bgr is None:
-            st.info("👈 请先上传待测图片")
-        elif det1 is None:
-            st.warning("请在左侧选择检测视角。")
-        elif det2 is None:
-            st.error(f"ONNX 模型文件不存在：{_ONNX_PATH}")
+# ── 左：上传 ─────────────────────────────────────────────────────────
+with col_up:
+    st.subheader("① 上传待测图片")
+    uploaded = st.file_uploader(
+        "拖拽或点击上传（PNG / JPG / BMP）",
+        type=["png","jpg","jpeg","bmp"],
+        label_visibility="collapsed",
+    )
+    img_bgr: np.ndarray | None = None
+    if uploaded:
+        img_bgr = bytes_to_bgr(uploaded.read())
+        if img_bgr is not None:
+            h, w = img_bgr.shape[:2]
+            st.image(bgr_to_rgb(img_bgr),
+                     caption=f"待测原图  {w}×{h}px", width="stretch")
         else:
-            h_img, w_img = img_bgr.shape[:2]
-            calib_bbox = calib_to_abs(roi_rel, w_img, h_img) if roi_rel else None
+            st.error("图片解码失败，请重新上传。")
 
-            # ════════════════════════════════════════
-            # Stage 1
-            # ════════════════════════════════════════
-            st.markdown('<div class="stage-divider">Stage 1 — 结构初筛</div>',
-                        unsafe_allow_html=True)
+# ── 右：结果 ─────────────────────────────────────────────────────────
+with col_res:
+    st.subheader("② 检测结果")
 
-            with st.spinner("Stage 1 检测中..."):
-                r1 = det1.inspect_with_localization(
-                    img_bgr,
-                    min_match_count=match_thresh,
-                    missing_regions_fail_count=missing_thresh,
-                    calibrated_bbox=calib_bbox,
-                )
+    if img_bgr is None:
+        st.info("👈 请先上传待测图片")
+    elif det1 is None:
+        st.warning("请在左侧选择检测视角。")
+    elif det2 is None:
+        st.error(f"ONNX 模型文件不存在：{_ONNX_PATH}")
+    else:
+        r2: dict | None = None
 
-            s1_status = r1["status"]
+        # ════════════════════════════════════════
+        # Stage 1
+        # ════════════════════════════════════════
+        step_header("Stage 1 — 结构初筛")
+
+        with st.spinner("Stage 1 检测中…"):
+            r1 = det1.inspect_with_localization(
+                img_bgr,
+                min_match_count=match_thresh,
+                missing_regions_fail_count=missing_thresh,
+                calibrated_bbox=None,
+            )
+
+        s1_status = r1["status"]
+        st.markdown(
+            verdict_card_html(
+                s1_status,
+                r1["issues"],
+                r1["warnings"],
+                title={
+                    "PASS":   "Stage 1 通过 → 进入细筛",
+                    "FAIL":   "Stage 1 不合格 → 终止",
+                    "RETAKE": "Stage 1 需重拍 → 终止",
+                }.get(s1_status, s1_status),
+            ),
+            unsafe_allow_html=True,
+        )
+
+        pose_angle   = r1.get("pose_angle", 0.0)
+        pose_warning = r1.get("pose_warning")
+        label_ratio  = r1.get("label_area_ratio", 0.0) * 100
+        loc_method   = r1.get("localization_method", "自动")
+
+        if pose_warning:
+            if pose_angle >= 28.0:
+                st.error(f"🔴 Stage1 姿态告警：{pose_warning}")
+            else:
+                st.warning(f"⚠️ Stage1 姿态提示：{pose_warning}")
+
+        st.markdown(
+            metric_row([
+                ("定位方式",   loc_method),
+                ("覆膜率",     f"{r1['film_coverage']*100:.1f}%"),
+                ("相似度",     f"{r1['similarity']*100:.0f}%"),
+                ("定位置信度", f"{r1['localization_score']:.3f}"),
+                ("缺件框",     f"{len(r1['missing_regions'])}"),
+                ("标签区域",   f"{label_ratio:.1f}%"),
+                ("偏斜角",     f"{pose_angle:.1f}°"),
+            ]),
+            unsafe_allow_html=True,
+        )
+
+        ann1 = r1.get("annotated_image")
+        cut1 = r1.get("cutout_image")
+        cut_rgba1 = r1.get("cutout_rgba")
+        if ann1 is not None or cut1 is not None or cut_rgba1 is not None:
+            c_stage1_left, c_stage1_mid, c_stage1_right = st.columns(3, gap="medium")
+            with c_stage1_left:
+                if cut_rgba1 is not None:
+                    st.image(
+                        bgra_to_rgba(cut_rgba1),
+                        caption="Stage 1 透明抠图",
+                        width="stretch",
+                    )
+                else:
+                    st.info("透明抠图未生成")
+            with c_stage1_mid:
+                if cut1 is not None:
+                    st.image(
+                        cutout_to_display(cut1),
+                        caption="Stage 1 透明抠图（兼容字段）",
+                        width="stretch",
+                    )
+                else:
+                    st.info("兼容抠图未生成")
+            with c_stage1_right:
+                if ann1 is not None:
+                    st.image(
+                        bgr_to_rgb(ann1),
+                        caption="Stage 1 标注图（黄框=产品区域）",
+                        width="stretch",
+                    )
+                else:
+                    st.info("标注图未生成")
+
+        # ════════════════════════════════════════
+        # Stage 2（仅在 Stage 1 PASS 时执行）
+        # ════════════════════════════════════════
+        step_header("Stage 2 — 划痕/裂纹细筛")
+
+        if s1_status != "PASS":
             st.markdown(
-                card_html(s1_status, r1["issues"], r1["warnings"],
-                          title_override={
-                              "PASS":   "Stage 1 通过 → 进入细筛",
-                              "FAIL":   "Stage 1 不合格 → 终止",
-                              "RETAKE": "Stage 1 需重拍 → 终止",
-                          }.get(s1_status, s1_status)),
+                verdict_card_html(
+                    "SKIP", [], [],
+                    title="已跳过（Stage 1 未通过）",
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            with st.spinner("Stage 2 YOLO 检测中…"):
+                r2 = det2.inspect(img_bgr, r1)
+
+            s2_status = r2["status"]
+            n_scratch  = r2["defect_counts"].get("scratch", 0)
+            n_crack    = r2["defect_counts"].get("crack",   0)
+            n_total    = len(r2["defects"])
+
+            st.markdown(
+                verdict_card_html(
+                    s2_status,
+                    r2["issues"],
+                    [],
+                    title={
+                        "PASS": "表面无缺陷 — 合格",
+                        "FAIL": f"发现 {n_total} 处表面缺陷",
+                    }.get(s2_status, s2_status),
+                ),
                 unsafe_allow_html=True,
             )
 
             st.markdown(
-                metric_html([
-                    ("定位方式", "已标定" if roi_rel else "自动"),
-                    ("覆膜率",   f"{r1['film_coverage']*100:.1f}%"),
-                    ("相似度",   f"{r1['similarity']*100:.0f}%"),
-                    ("定位置信", f"{r1['localization_score']:.3f}"),
-                    ("异常框",   f"{len(r1['missing_regions'])}"),
+                metric_row([
+                    ("划痕 scratch", str(n_scratch)),
+                    ("裂纹 crack",   str(n_crack)),
+                    ("总缺陷数",     str(n_total)),
+                    ("置信度阈值",   f"{conf_thresh:.2f}"),
                 ]),
                 unsafe_allow_html=True,
             )
 
-            ann1 = r1.get("annotated_image")
-            if ann1 is not None:
-                st.image(bgr_to_rgb(ann1),
-                         caption="Stage 1 标注图（黄框=产品区域）",
-                         width="stretch")
+            ann2 = r2.get("annotated_image")
+            crop2 = r2.get("crop_image")
+            box2 = r2.get("crop_box")
 
-            # ════════════════════════════════════════
-            # Stage 2（仅在 Stage 1 PASS 时执行）
-            # ════════════════════════════════════════
-            st.markdown('<div class="stage-divider">Stage 2 — 划痕/裂纹细筛</div>',
-                        unsafe_allow_html=True)
-
-            if s1_status != "PASS":
-                st.markdown(
-                    card_html("SKIP", [], [],
-                              title_override="已跳过（Stage 1 未通过）"),
-                    unsafe_allow_html=True,
-                )
-            else:
-                with st.spinner("Stage 2 YOLO 检测中..."):
-                    r2 = det2.inspect(img_bgr, r1)
-
-                s2_status = r2["status"]
-                n_scratch  = r2["defect_counts"].get("scratch", 0)
-                n_crack    = r2["defect_counts"].get("crack",   0)
-                n_total    = len(r2["defects"])
-
-                st.markdown(
-                    card_html(
-                        s2_status, r2["issues"], [],
-                        title_override={
-                            "PASS": "表面无缺陷 — 合格",
-                            "FAIL": f"发现 {n_total} 处表面缺陷",
-                        }.get(s2_status, s2_status),
-                    ),
-                    unsafe_allow_html=True,
-                )
-
-                st.markdown(
-                    metric_html([
-                        ("划痕 scratch", str(n_scratch)),
-                        ("裂纹 crack",   str(n_crack)),
-                        ("总缺陷数",     str(n_total)),
-                        ("置信度阈值",   f"{conf_thresh:.2f}"),
-                    ]),
-                    unsafe_allow_html=True,
-                )
-
-                ann2 = r2.get("annotated_image")
-                if ann2 is not None:
+            if ann2 is not None and show_crop and crop2 is not None:
+                c2_left, c2_right = st.columns(2, gap="small")
+                with c2_left:
                     st.image(
                         bgr_to_rgb(ann2),
-                        caption="Stage 2 标注图（蓝框=划痕 | 橙框=裂纹 | 黄框=产品区域）",
+                        caption="全图标注（蓝=划痕 | 橙=裂纹 | 黄=产品 ROI）",
                         width="stretch",
                     )
-
-                if show_crop:
-                    crop = r2.get("crop_image")
-                    if crop is not None:
-                        st.markdown("**产品裁剪图（Stage 2 输入）**")
-                        st.image(bgr_to_rgb(crop),
-                                 caption="产品 ROI（含 padding）",
-                                 width="stretch")
-
-                if show_detail and r2["defects"]:
-                    st.markdown("**缺陷详情：**")
-                    for i, d in enumerate(r2["defects"], 1):
-                        b = d["xyxy"]
-                        st.markdown(
-                            f"- [{i}] **{d['class_name']}**  "
-                            f"置信度={d['score']:.3f}  "
-                            f"坐标=({b[0]},{b[1]})→({b[2]},{b[3]})  "
-                            f"面积={d['area']}px²"
-                        )
-
-            # ── 综合结论 ─────────────────────────────────────────────────
-            st.markdown("---")
-            if s1_status == "PASS" and "r2" in dir():
-                final = "PASS" if r2["status"] == "PASS" else "FAIL"
-                final_msg = {
-                    "PASS": "两阶段检测全部通过，产品合格",
-                    "FAIL": "Stage 2 细筛发现表面缺陷，产品不合格",
-                }[final]
-                st.markdown(
-                    card_html(final, [], [], title_override=final_msg),
-                    unsafe_allow_html=True,
+                with c2_right:
+                    crop_vis = stage2_crop_with_defects(
+                        crop2, r2.get("defects") or [], box2,
+                    )
+                    st.image(
+                        bgr_to_rgb(crop_vis),
+                        caption="产品裁剪 ROI（与 YOLO 输入一致；框为局部坐标）",
+                        width="stretch",
+                    )
+            elif ann2 is not None:
+                st.image(
+                    bgr_to_rgb(ann2),
+                    caption="Stage 2 标注图（蓝框=划痕 | 橙框=裂纹 | 黄框=产品区域）",
+                    width="stretch",
                 )
-            elif s1_status in ("FAIL", "RETAKE"):
-                st.markdown(
-                    card_html("FAIL", r1["issues"], [],
-                              title_override="Stage 1 未通过，产品不合格"),
-                    unsafe_allow_html=True,
+            elif show_crop and crop2 is not None:
+                crop_vis = stage2_crop_with_defects(
+                    crop2, r2.get("defects") or [], box2,
+                )
+                st.image(
+                    bgr_to_rgb(crop_vis),
+                    caption="产品裁剪 ROI",
+                    width="stretch",
                 )
 
+            if show_detail and r2["defects"]:
+                st.markdown("**缺陷详情：**")
+                for i, d in enumerate(r2["defects"], 1):
+                    b = d["xyxy"]
+                    st.markdown(
+                        f"- [{i}] **{d['class_name']}**  "
+                        f"置信度={d['score']:.3f}  "
+                        f"坐标=({b[0]},{b[1]})→({b[2]},{b[3]})  "
+                        f"面积={d['area']}px²"
+                    )
 
-# ════════════════════════════════════════════════════════════════════════
-# Tab 2 — ROI 标定
-# ════════════════════════════════════════════════════════════════════════
-with tab_calib:
-    st.markdown(
-        "通过拖动滑块标定**固定产品区域（ROI）**，"
-        "保存后检测时会跳过自动定位，直接使用该区域。"
-    )
-
-    if not available_views:
-        st.error("未找到任何视角的标准图库，无法标定。")
-    else:
-        c_sel, c_prev = st.columns([1, 1.5], gap="large")
-
-        with c_sel:
-            calib_view_label = st.selectbox(
-                "选择要标定的视角",
-                options=view_display,
-                key="calib_view_sel",
-            )
-            calib_view = view_map.get(calib_view_label, calib_view_label)
-
-            # 读取当前标定值（如有）
-            existing = load_calibration(calib_view) or [0.10, 0.10, 0.90, 0.90]
-
-            st.markdown("#### 拖动滑块调整 ROI 边界（单位：图像宽/高比例）")
-            roi_x1 = st.slider("左边界 X1", 0.00, 0.90, float(existing[0]), 0.01,
-                                key="rx1")
-            roi_y1 = st.slider("上边界 Y1", 0.00, 0.90, float(existing[1]), 0.01,
-                                key="ry1")
-            roi_x2 = st.slider("右边界 X2", 0.10, 1.00, float(existing[2]), 0.01,
-                                key="rx2")
-            roi_y2 = st.slider("下边界 Y2", 0.10, 1.00, float(existing[3]), 0.01,
-                                key="ry2")
-
-            if roi_x2 <= roi_x1:
-                st.warning("⚠ X2 必须大于 X1")
-            if roi_y2 <= roi_y1:
-                st.warning("⚠ Y2 必须大于 Y1")
-
-            st.markdown("---")
-            ref_upload = st.file_uploader(
-                "上传一张参考图预览 ROI（可选，不上传则仅保存坐标）",
-                type=["png","jpg","jpeg","bmp"],
-                key="calib_ref_upload",
-            )
-
-            col_save, col_clear = st.columns(2)
-            with col_save:
-                if st.button("💾 保存标定", use_container_width=True):
-                    if roi_x2 > roi_x1 and roi_y2 > roi_y1:
-                        roi_wh = (1920, 1080)
-                        if ref_upload:
-                            ref_img = bytes_to_bgr(ref_upload.read())
-                            if ref_img is not None:
-                                roi_wh = (ref_img.shape[1], ref_img.shape[0])
-                        save_calibration(
-                            calib_view,
-                            [roi_x1, roi_y1, roi_x2, roi_y2],
-                            roi_wh,
-                        )
-                        st.success(
-                            f"已保存 **{calib_view_label}** ROI → "
-                            f"[{roi_x1:.2f}, {roi_y1:.2f}, "
-                            f"{roi_x2:.2f}, {roi_y2:.2f}]"
-                        )
-                        st.rerun()
-                    else:
-                        st.error("ROI 参数无效，请检查 X1<X2 且 Y1<Y2。")
-
-            with col_clear:
-                if st.button("🗑 清除标定", use_container_width=True):
-                    p = _CALIB_DIR / f"{calib_view}.json"
-                    if p.exists():
-                        p.unlink()
-                        st.success(f"已清除 **{calib_view_label}** 的标定文件")
-                        st.rerun()
-                    else:
-                        st.info("该视角暂无标定文件。")
-
-        with c_prev:
-            st.markdown("#### 预览")
-            cur_roi = load_calibration(calib_view)
-            status_text = (
-                f"已标定：[{cur_roi[0]:.2f}, {cur_roi[1]:.2f}, "
-                f"{cur_roi[2]:.2f}, {cur_roi[3]:.2f}]"
-                if cur_roi else "未标定（自动定位）"
-            )
-            badge_color = "#d4edda" if cur_roi else "#fff3cd"
+        # ── 综合结论 ─────────────────────────────────────────────────
+        st.markdown("---")
+        if s1_status == "PASS" and r2 is not None:
+            final = "PASS" if r2["status"] == "PASS" else "FAIL"
+            final_msg = {
+                "PASS": "两阶段检测全部通过，产品合格",
+                "FAIL": "Stage 2 细筛发现表面缺陷，产品不合格",
+            }[final]
             st.markdown(
-                f'<span style="background:{badge_color};padding:4px 12px;'
-                f'border-radius:6px;font-size:0.85rem;">{status_text}</span>',
+                verdict_card_html(final, [], [], title=final_msg),
                 unsafe_allow_html=True,
             )
-            st.markdown("")
+        elif s1_status in ("FAIL", "RETAKE"):
+            st.markdown(
+                verdict_card_html(
+                    "FAIL",
+                    r1["issues"],
+                    [],
+                    title="Stage 1 未通过，产品不合格",
+                ),
+                unsafe_allow_html=True,
+            )
 
-            def _load_bgr_pil(path_or_bytes) -> np.ndarray | None:
-                """用 PIL 加载图像，兼容中文路径，返回 BGR ndarray。"""
-                try:
-                    from PIL import Image as _PILImage
-                    import io as _io
-                    if isinstance(path_or_bytes, (str, Path)):
-                        pil = _PILImage.open(str(path_or_bytes)).convert("RGB")
-                    else:
-                        pil = _PILImage.open(_io.BytesIO(path_or_bytes)).convert("RGB")
-                    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-                except Exception as e:
-                    return None
-
-            roi_now = [roi_x1, roi_y1, roi_x2, roi_y2]
-
-            if ref_upload is not None:
-                ref_upload.seek(0)
-                ref_img_data = _load_bgr_pil(ref_upload.read())
-                if ref_img_data is not None:
-                    preview = draw_roi_preview(ref_img_data, roi_now)
-                    st.image(bgr_to_rgb(preview),
-                             caption="ROI 预览（绿框 = 标定区域）", width="stretch")
-                else:
-                    st.error("参考图解码失败，请重新上传。")
-            else:
-                # 自动用标准图库第一张图作预览底图
-                std_dir = _STD_ROOT / calib_view
-                first_std = None
-                if std_dir.is_dir():
-                    first_std = next(
-                        (f for f in sorted(std_dir.iterdir())
-                         if f.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}),
-                        None,
-                    )
-
-                if first_std:
-                    std_img = _load_bgr_pil(first_std)
-                    if std_img is not None:
-                        preview = draw_roi_preview(std_img, roi_now)
-                        st.image(
-                            bgr_to_rgb(preview),
-                            caption=f"底图：{first_std.name}（绿框 = 当前 ROI）",
-                            width="stretch",
-                        )
-                    else:
-                        st.warning(
-                            f"标准图加载失败（{first_std.name}），"
-                            "请在左侧上传参考图手动预览。"
-                        )
-                else:
-                    st.info(
-                        f"视角 **{calib_view_label}** 的标准图库为空，"
-                        "请上传参考图预览 ROI。"
-                    )
